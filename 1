@@ -1,1 +1,2888 @@
 
+const axios = require('axios');
+const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+
+// 🔥 ИМПОРТ АДМИН-ПАНЕЛИ ИЗ ОТДЕЛЬНОГО ФАЙЛА
+//const { adminPanelHTML } = require('./adminPanelHTML');
+
+// ====================== НАСТРОЙКИ ======================
+const BUCKET_NAME = process.env.BUCKET_NAME || 'bot-data-storage';
+const VK_TOKEN = process.env.VK_TOKEN;
+const SECRET_KEY = process.env.SECRET_KEY;
+const CONFIRMATION_TOKEN = process.env.CONFIRMATION_TOKEN;
+const LOG_LEVEL = process.env.LOG_LEVEL || 'debug';
+const s3Client = new S3Client({
+region: 'ru-central1',
+endpoint: 'https://storage.yandexcloud.net',
+credentials: {
+accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+}
+});
+
+
+
+// ====================== CONFIRMATION CODE ИЗ S3 ======================////
+async function getConfirmationCodeFromStorage(groupId) {
+    try {
+        const response = await s3Client.send(new GetObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: `confirmation_codes/${groupId}.json`
+        }));
+        const data = await response.Body.transformToString();
+        const json = JSON.parse(data);
+        log('debug', `✅ Loaded confirmation code for group ${groupId}`);
+        return json.code || 'ok';
+    } catch (error) {
+        log('debug', `⚠️ No confirmation code found for group ${groupId}, using 'ok'`);
+        return 'ok'; // Возвращаем 'ok' если код не найден
+    }
+}
+
+async function saveConfirmationCodeToStorage(groupId, code) {
+    try {
+        await s3Client.send(new PutObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: `confirmation_codes/${groupId}.json`,
+            Body: JSON.stringify({
+                group_id: groupId,
+                code: code,
+                updated_at: new Date().toISOString()
+            }, null, 2),
+            ContentType: 'application/json'
+        }));
+        log('info', `✅ Saved confirmation code for group ${groupId}`);
+        return true;
+    } catch (error) {
+        log('error', `❌ Error saving confirmation code:`, error.message);
+        return false;
+    }
+}
+
+
+// ====================== КЭШИРОВАНИЕ ======================
+const memoryCache = {
+   data: {},
+  lastUpdated: {},
+  ttl: {
+    'USERS': 60 * 1000,
+    'Переменные': 60 * 1000,
+    'MESSAGES COMMUNITY': 10 * 60 * 1000,
+    'COMMENTS': 10 * 60 * 1000,
+    'Рассылка': 10 * 60 * 1000,
+    'Отложенные': 5 * 1000  // 🔥 НОВОЕ: Чаще проверяем отложенные
+  }
+};
+
+const processedMessages = new Map();
+const MESSAGE_TTL = 5 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamp] of processedMessages.entries()) {
+    if (now - timestamp > MESSAGE_TTL) processedMessages.delete(key);
+  }
+}, 60000);
+
+const userNamesCache = {};
+
+const FILE_MAP = {
+  'MESSAGES COMMUNITY': 'messages_community.json',
+  'COMMENTS': 'comments.json',
+  'USERS': 'users.json',
+  'Переменные': 'variables.json',
+  'Рассылка': 'mailing.json',
+  'Отложенные': 'delayed.json'  // 🔥 НОВОЕ 
+};
+
+// ====================== ДЕФОЛТНЫЕ ДАННЫЕ ======================
+const DEFAULT_DATA = {
+  'MESSAGES COMMUNITY': [{
+    "№": "1",
+    "Триггер": "привет",
+    "Бот": "main",
+    "Шаг": "start",
+    "Ответ": "Привет! Чем могу помочь?",
+    "Точно/Не точно": "НЕ ТОЧНО",
+    "Регистр": "не важно",
+    "Ответить если в Группе": "",
+    "Пользовательская": "",
+    "Глобальная": "",
+    "Ответил на Шаг": "",
+    "ГРУППА": "",
+    "УДАЛИТЬ ГРУППУ": "",
+    "Отправить на Шаг": "",
+    "Действия с ПП/ГП/ПВК": "",
+    "Заготовленный ответ": "Это Автоматический ответ. Я нахожусь в разработке )))",
+    "Кнопка Ответа-1": "11",
+    "Цвет/Ссылка Ответа-1": "красный",
+    "Кнопка Ответа-2": "22",
+    "Цвет/Ссылка Ответа-2": "зеленый",
+    "Кнопка ЗО-1": "1",
+    "Цвет/Ссылка ЗО-1": "красный",
+    "Кнопка ЗО-2": "2",
+    "Цвет/Ссылка ЗО-2": "зеленый"
+  }],
+  'COMMENTS': [{
+    "№": "1",
+    "Триггер": "спасибо",
+    "Пост": "ВСЕ",
+    "Отметили": "",
+    "Ответ": "Пожалуйста!",
+    "Точно/Не точно": "НЕ ТОЧНО",
+    "Регистр": "не важно",
+    "Заготовленный ответ": "Спасибо за комментарий!"
+  }],
+  'USERS': [],
+  'Переменные': [{
+    "Пользовательская": "10",
+    "Значение ПП": "",
+    "Глобальная": "100",
+    "Значение ГП": "а100",
+    "Переменные ВК": "%vk_user%",
+    "Значение/Описание ПВК": "имя пользователя"
+  }],
+  'Рассылка': [],
+  'Отложенные': []  // 🔥 НОВОЕ: Для отложенных шагов диалога
+};
+
+// ====================== ЛОГГЕР ======================
+function log(level, ...args) {
+  const levels = ['debug', 'info', 'warn', 'error', 'none'];
+  const currentLevelIndex = levels.indexOf(LOG_LEVEL);
+  const messageLevelIndex = levels.indexOf(level);
+  if (messageLevelIndex < currentLevelIndex) return;
+  
+  const timestamp = new Date().toISOString();
+  if (level === 'error') {
+    console.error(`[${timestamp}] [${level.toUpperCase()}]`, ...args);
+  } else if (level === 'warn') {
+    console.warn(`[${timestamp}] [${level.toUpperCase()}]`, ...args);
+  } else if (level === 'info') {
+    console.info(`[${timestamp}] [${level.toUpperCase()}]`, ...args);
+  } else if (level === 'debug') {
+    console.debug(`[${timestamp}] [${level.toUpperCase()}]`, ...args);
+  } else {
+    console.log(`[${timestamp}] [${level.toUpperCase()}]`, ...args);
+  }
+}
+
+// ====================== ИНИЦИАЛИЗАЦИЯ S3 ======================
+async function initializeStorage() {
+  log('info', '🔧 Checking Object Storage initialization...');
+  for (const [sheetName, fileName] of Object.entries(FILE_MAP)) {
+    try {
+      await s3Client.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: fileName }));
+      log('debug', `✅ File exists: ${fileName}`);
+    } catch (error) {
+      if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) {
+        log('info', `📄 Creating ${fileName}...`);
+        try {
+          await s3Client.send(new PutObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: fileName,
+            Body: JSON.stringify(DEFAULT_DATA[sheetName] || [], null, 2),
+            ContentType: 'application/json'
+          }));
+          log('info', `✅ Created ${fileName}`);
+        } catch (createError) {
+          log('error', `❌ Failed to create ${fileName}:`, createError.message);
+        }
+      }
+    }
+  }
+}
+
+// ====================== РАБОТА С ДАННЫМИ ======================
+async function getSheetData(sheetName) {
+  const fileName = FILE_MAP[sheetName];
+  if (!fileName) {
+    log('error', `Unknown sheet: ${sheetName}`);
+    return [];
+  }
+  
+  const now = Date.now();
+  const ttl = memoryCache.ttl[sheetName] || 300000;
+  
+  if (memoryCache.data[sheetName] && (now - memoryCache.lastUpdated[sheetName]) < ttl) {
+    return memoryCache.data[sheetName];
+  }
+  
+  try {
+    const response = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: fileName }));
+    const data = await response.Body.transformToString();
+    const json = JSON.parse(data);
+    
+    memoryCache.data[sheetName] = json;
+    memoryCache.lastUpdated[sheetName] = now;
+    log('debug', `Loaded ${sheetName}: ${json?.length || 0} rows`);
+    return json;
+  } catch (error) {
+    log('error', `Error loading ${sheetName}:`, error.message);
+    return memoryCache.data[sheetName] || [];
+  }
+}
+
+async function saveSheetData(sheetName, data) {
+  const fileName = FILE_MAP[sheetName];
+  if (!fileName) throw new Error(`Unknown sheet: ${sheetName}`);
+  
+  try {
+    log('info', `💾 Saving ${sheetName}...`);
+    await s3Client.send(new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: fileName,
+      Body: JSON.stringify(data, null, 2),
+      ContentType: 'application/json'
+    }));
+    
+    memoryCache.data[sheetName] = data;
+    memoryCache.lastUpdated[sheetName] = Date.now();
+    log('info', `✅ Saved ${sheetName} successfully`);
+    return true;
+  } catch (error) {
+    log('error', `❌ Error saving ${sheetName}:`, error.message);
+    throw error;
+  }
+}
+
+function invalidateCache(sheetName) {
+  delete memoryCache.data[sheetName];
+  delete memoryCache.lastUpdated[sheetName];
+  log('debug', `[Cache] Invalidated: ${sheetName}`);
+}
+
+function splitVars(str) {
+  return (str || '').split(/[\n,]+/).map(v => v.trim()).filter(v => v);
+}
+
+// ====================== ПРОВЕРКА ТРИГГЕРОВ ======================
+async function checkTriggerMatch(text, trigger, matchType, caseSensitive, userId, groupId) {
+  try {
+    if (!trigger || !trigger.trim()) {
+      log('debug', `❌ No trigger specified`);
+      return false;
+    }
+    
+    let cleanTrigger = trigger.trim();
+    
+    if (cleanTrigger.includes('{$') || cleanTrigger.includes('[$') || cleanTrigger.includes('%')) {
+      log('debug', `🔍 Trigger contains variables, replacing...`);
+      const processedTrigger = await replaceVariables(cleanTrigger, userId, groupId);
+      cleanTrigger = processedTrigger.trim();
+    }
+    
+    log('debug', `🔍 Trigger: original="${trigger}", processed="${cleanTrigger}"`);
+    
+    if (!cleanTrigger) {
+      log('debug', `❌ Empty trigger after processing`);
+      return false;
+    }
+    
+    const triggerPatterns = cleanTrigger.split(',').map(t => t.trim()).filter(t => t);
+    log('debug', `🔍 Trigger patterns: [${triggerPatterns.map(p => `"${p}"`).join(', ')}]`);
+    
+    const actualMatchType = (matchType || '').trim().toUpperCase() || 'НЕ ТОЧНО';
+    const isCaseSensitive = (caseSensitive || '').trim().toLowerCase() === 'важно';
+    log('debug', `🔍 Match type: ${actualMatchType}, Case sensitive: ${isCaseSensitive}`);
+    
+    for (const pattern of triggerPatterns) {
+      log('debug', `🔍 Checking pattern: "${pattern}" vs user text: "${text}"`);
+      let matchFound = false;
+      
+      if (actualMatchType === 'ТОЧНО') {
+        if (isCaseSensitive) {
+          matchFound = text === pattern;
+          log('debug', `🔍 Exact case-sensitive: "${text}" === "${pattern}" → ${matchFound}`);
+        } else {
+          matchFound = text.toLowerCase() === pattern.toLowerCase();
+          log('debug', `🔍 Exact case-insensitive: "${text.toLowerCase()}" === "${pattern.toLowerCase()}" → ${matchFound}`);
+        }
+      } else {
+        if (isCaseSensitive) {
+          matchFound = text.includes(pattern);
+          log('debug', `🔍 Partial case-sensitive: "${text}" includes "${pattern}" → ${matchFound}`);
+        } else {
+          const textLower = text.toLowerCase();
+          const patternLower = pattern.toLowerCase();
+          matchFound = textLower.includes(patternLower);
+          log('debug', `🔍 Partial case-insensitive: "${textLower}" includes "${patternLower}" → ${matchFound}`);
+        }
+      }
+      
+      if (matchFound) {
+        log('debug', `✅ Pattern "${pattern}" MATCHED!`);
+        return true;
+      } else {
+        log('debug', `❌ Pattern "${pattern}" not matched`);
+      }
+    }
+    
+    log('debug', `❌ No trigger patterns matched`);
+    return false;
+  } catch (error) {
+    log('error', `❌ Error in checkTriggerMatch:`, error);
+    return false;
+  }
+}
+
+// ====================== ПРОВЕРКА ГРУПП ======================
+async function checkUserGroups(userId, required) {
+  try {
+    if (!required || !required.trim()) return true;
+    
+    log('debug', `🔍 Checking groups for user ${userId}, required: "${required}"`);
+    
+    invalidateCache('USERS');
+    const users = await getSheetData('USERS');
+    const user = users.find(u => u['ID'] == userId);
+    
+    if (!user) {
+      log('debug', `❌ User ${userId} not found`);
+      return false;
+    }
+    
+    // 🔥 Поддержка обоих форматов: запятые И новые строки
+const userGroups = (user['ГРУППА'] || '')
+    .split(/[\n,]+/)  // 🔥 Разделяем по \n ИЛИ ,
+    .map(g => g.trim().toLowerCase())
+    .filter(g => g);
+    const requiredGroupsArray = required.split(',').map(g => g.trim().toLowerCase());
+    
+    log('debug', `🔍 User groups: [${userGroups}], Required: [${requiredGroupsArray}]`);
+    
+    const hasRequiredGroup = requiredGroupsArray.some(req => userGroups.includes(req));
+    
+    log('debug', `🔍 Group check result: ${hasRequiredGroup}`);
+    return hasRequiredGroup;
+  } catch (error) {
+    log('error', '❌ Error checking user groups:', error);
+    return false;
+  }
+}
+
+// ====================== ПРОВЕРКА ШАГОВ ======================
+function checkStepCondition(requiredSteps, userSteps) {
+  if (!requiredSteps || !requiredSteps.trim()) return true;
+  if (!userSteps || !userSteps.trim()) return false;
+  
+  const requiredStepsArray = requiredSteps.split(',').map(s => s.trim());
+  const userStepsArray = userSteps.split(',').map(s => s.trim());
+  
+  log('debug', `🔍 Step check: required=[${requiredStepsArray}], user=[${userStepsArray}]`);
+  
+  return requiredStepsArray.some(step => userStepsArray.includes(step));
+}
+
+async function getUserCurrentSteps(userId, bot = null) {
+    try {
+        const users = await getSheetData('USERS');
+        const user = users.find(u => u['ID'] == userId);
+        if (!user) return '';
+        
+const allBots = (user['Текущий Бот'] || '')
+    .split(/[\n,]+/)  // 🔥 Разделяем по \n ИЛИ ,
+    .map(b => b.trim())
+    .filter(b => b);
+
+const allSteps = (user['Текущий Шаг'] || '')
+    .split(/[\n,]+/)  // 🔥 Разделяем по \n ИЛИ ,
+    .map(s => s.trim())
+    .filter(s => s);
+        
+        // 🔥 Если указан бот - возвращаем шаги только этого бота
+        if (bot) {
+            const botIndex = allBots.findIndex(b => b === bot);
+            if (botIndex !== -1 && allSteps[botIndex]) {
+                return allSteps[botIndex];
+            }
+            return '';
+        }
+        
+        // 🔥 Если бот не указан - возвращаем все шаги (для обратной совместимости)
+        const steps = user ? (user['Текущий Шаг'] || '') : '';
+        log('debug', `🔍 User ${userId} current steps: "${steps}"`);
+        return steps;
+    } catch (error) {
+        log('error', 'Error getting user steps:', error);
+        return '';
+    }
+}
+
+
+// ====================== ВСЕ УСЛОВИЯ ======================
+async function checkAllConditions(row, options) {
+    try {
+        const { userId, groupId, text, eventType = 'message', postId, commentText } = options;
+        log('debug', `🔍 Checking ALL conditions for user ${userId}`);
+        
+        // 🔥 ПЕРЕМЕННЫЕ ОБЪЯВЛЕНЫ СРАЗУ В НАЧАЛЕ
+        const userVarCondition = (row['Пользовательская Переменная ПП'] || '').trim();
+        const globalVarCondition = (row['Глобальная Переменная ГП'] || '').trim();
+        
+        // 1. Проверка групп
+        const requiredGroups = (row['Ответить если в Группе'] || '').trim();
+        if (requiredGroups) {
+            log('debug', `🔍 Checking groups: "${requiredGroups}"`);
+            const userInGroups = await checkUserGroups(userId, requiredGroups);
+            if (!userInGroups) {
+                log('debug', `❌ User not in required groups`);
+                return false;
+            }
+            log('debug', `✅ User is in required groups`);
+        }
+        
+        // 2. Проверка шага (только для сообщений)
+        if (eventType === 'message') {
+            const requiredStep = (row['Ответил на Шаг'] || '').trim();
+            if (requiredStep) {
+                log('debug', `🔍 Checking step: "${requiredStep}"`);
+                const userSteps = await getUserCurrentSteps(userId);
+                log('debug', `🔍 User current steps: "${userSteps}"`);
+                const stepCondition = checkStepCondition(requiredStep, userSteps);
+                if (!stepCondition) {
+                    log('debug', `❌ Step condition not met`);
+                    return false;
+                }
+                log('debug', `✅ Step condition met`);
+            }
+        }
+        
+        // 3. 🔥 ПРОВЕРКА ПЕРЕМЕННЫХ (теперь переменные уже объявлены)
+        if (userVarCondition || globalVarCondition) {
+            log('debug', `🔍 Checking variable conditions`);
+            const varConditionsMet = await checkVariableConditions(userVarCondition, globalVarCondition, userId, groupId);
+            if (!varConditionsMet) {
+                log('debug', `❌ Variable conditions not met`);
+                return false;
+            }
+            log('debug', `✅ Variable conditions met`);
+        }
+        
+        // 4. Для комментариев - проверка поста и отметки
+        if (eventType === 'comment') {
+            const postCondition = (row['Пост'] || '').trim();
+            if (postCondition && postCondition !== 'ВСЕ') {
+                const allowedPosts = postCondition.split(',').map(p => p.trim());
+                const postMatch = allowedPosts.includes(postId);
+                if (!postMatch) {
+                    log('debug', `❌ Post condition not met`);
+                    return false;
+                }
+            }
+            const mentionCondition = (row['Отметили'] || '').trim().toUpperCase();
+            if (mentionCondition) {
+                const mentioned = checkCommunityMention(commentText, groupId);
+                if (mentionCondition === 'ДА' && !mentioned) {
+                    log('debug', `❌ Mention condition not met (required mention)`);
+                    return false;
+                }
+                if (mentionCondition === 'НЕТ' && mentioned) {
+                    log('debug', `❌ Mention condition not met (should not mention)`);
+                    return false;
+                }
+            }
+        }
+        
+        log('debug', `✅ All conditions passed`);
+        return true;
+    } catch (error) {
+        log('error', '❌ Error in checkAllConditions:', error);
+        return false;
+    }
+}
+
+
+
+
+// ====================== ПРОВЕРКА УСЛОВИЙ ПЕРЕМЕННЫХ ======================
+async function checkVariableConditions(userVarCondition, globalVarCondition, userId, groupId) {
+    try {
+        log('debug', `🔍 Checking variable conditions for user ${userId}`);
+        
+        // Проверка пользовательских переменных
+        if (userVarCondition && userVarCondition.trim()) {
+            const userVars = await getUserVariables(userId);
+            const conditions = userVarCondition.split(/[;,]/).map(c => c.trim()).filter(c => c);
+            
+            for (const condition of conditions) {
+                log('debug', `🔍 Checking user var condition: "${condition}"`);
+                
+                // Разбираем условие
+                let varName, operator, expectedValue;
+                
+                if (condition.includes('!=')) {
+                    [varName, expectedValue] = condition.split('!=').map(s => s.trim());
+                    operator = '!=';
+                } else if (condition.includes('>=')) {
+                    [varName, expectedValue] = condition.split('>=').map(s => s.trim());
+                    operator = '>=';
+                } else if (condition.includes('<=')) {
+                    [varName, expectedValue] = condition.split('<=').map(s => s.trim());
+                    operator = '<=';
+                } else if (condition.includes('=')) {
+                    [varName, expectedValue] = condition.split('=').map(s => s.trim());
+                    operator = '=';
+                } else if (condition.includes('>')) {
+                    [varName, expectedValue] = condition.split('>').map(s => s.trim());
+                    operator = '>';
+                } else if (condition.includes('<')) {
+                    [varName, expectedValue] = condition.split('<').map(s => s.trim());
+                    operator = '<';
+                } else {
+                    // Просто проверка существования
+                    varName = condition.trim();
+                    operator = 'exists';
+                }
+                
+                const varValue = userVars[varName.toLowerCase()];
+                
+                // Проверяем условие
+                let conditionMet = false;
+                
+                if (operator === 'exists') {
+                    conditionMet = varValue !== undefined;
+                    log('debug', `🔍 User var ${varName} exists: ${conditionMet}`);
+                } else if (operator === '=') {
+                    conditionMet = varValue === expectedValue;
+                    log('debug', `🔍 User var ${varName} = "${expectedValue}": ${conditionMet} (actual: "${varValue}")`);
+                } else if (operator === '!=') {
+                    conditionMet = varValue !== expectedValue;
+                    log('debug', `🔍 User var ${varName} != "${expectedValue}": ${conditionMet}`);
+                } else if (operator === '>') {
+                    conditionMet = parseFloat(varValue) > parseFloat(expectedValue);
+                    log('debug', `🔍 User var ${varName} > ${expectedValue}: ${conditionMet}`);
+                } else if (operator === '>=') {
+                    conditionMet = parseFloat(varValue) >= parseFloat(expectedValue);
+                    log('debug', `🔍 User var ${varName} >= ${expectedValue}: ${conditionMet}`);
+                } else if (operator === '<') {
+                    conditionMet = parseFloat(varValue) < parseFloat(expectedValue);
+                    log('debug', `🔍 User var ${varName} < ${expectedValue}: ${conditionMet}`);
+                } else if (operator === '<=') {
+                    conditionMet = parseFloat(varValue) <= parseFloat(expectedValue);
+                    log('debug', `🔍 User var ${varName} <= ${expectedValue}: ${conditionMet}`);
+                }
+                
+                if (!conditionMet) {
+                    log('debug', `❌ User variable condition failed: ${condition}`);
+                    return false;
+                }
+            }
+        }
+        
+        // Проверка глобальных переменных
+        if (globalVarCondition && globalVarCondition.trim()) {
+            const { globalVars } = await getGlobalVariables();
+            const conditions = globalVarCondition.split(/[;,]/).map(c => c.trim()).filter(c => c);
+            
+            for (const condition of conditions) {
+                log('debug', `🔍 Checking global var condition: "${condition}"`);
+                
+                let varName, operator, expectedValue;
+                
+                if (condition.includes('!=')) {
+                    [varName, expectedValue] = condition.split('!=').map(s => s.trim());
+                    operator = '!=';
+                } else if (condition.includes('==') || condition.includes('=')) {
+                    [varName, expectedValue] = condition.split(/==|=/).map(s => s.trim());
+                    operator = '=';
+                } else if (condition.includes('>')) {
+                    [varName, expectedValue] = condition.split('>').map(s => s.trim());
+                    operator = '>';
+                } else if (condition.includes('<')) {
+                    [varName, expectedValue] = condition.split('<').map(s => s.trim());
+                    operator = '<';
+                } else {
+                    varName = condition.trim();
+                    operator = 'exists';
+                }
+                
+                const varValue = globalVars[varName.toLowerCase()];
+                
+                let conditionMet = false;
+                
+                if (operator === 'exists') {
+                    conditionMet = varValue !== undefined;
+                    log('debug', `🔍 Global var ${varName} exists: ${conditionMet}`);
+                } else if (operator === '=') {
+                    conditionMet = varValue === expectedValue;
+                    log('debug', `🔍 Global var ${varName} = "${expectedValue}": ${conditionMet} (actual: "${varValue}")`);
+                } else if (operator === '!=') {
+                    conditionMet = varValue !== expectedValue;
+                    log('debug', `🔍 Global var ${varName} != "${expectedValue}": ${conditionMet}`);
+                } else if (operator === '>') {
+                    conditionMet = parseFloat(varValue) > parseFloat(expectedValue);
+                    log('debug', `🔍 Global var ${varName} > ${expectedValue}: ${conditionMet}`);
+                } else if (operator === '>=') {
+                    conditionMet = parseFloat(varValue) >= parseFloat(expectedValue);
+                    log('debug', `🔍 Global var ${varName} >= ${expectedValue}: ${conditionMet}`);
+                } else if (operator === '<') {
+                    conditionMet = parseFloat(varValue) < parseFloat(expectedValue);
+                    log('debug', `🔍 Global var ${varName} < ${expectedValue}: ${conditionMet}`);
+                } else if (operator === '<=') {
+                    conditionMet = parseFloat(varValue) <= parseFloat(expectedValue);
+                    log('debug', `🔍 Global var ${varName} <= ${expectedValue}: ${conditionMet}`);
+                }
+                
+                if (!conditionMet) {
+                    log('debug', `❌ Global variable condition failed: ${condition}`);
+                    return false;
+                }
+            }
+        }
+        
+        log('debug', `✅ All variable conditions passed`);
+        return true;
+    } catch (error) {
+        log('error', '❌ Error in checkVariableConditions:', error);
+        return false;
+    }
+}
+        
+
+// ====================== ПРОВЕРКА УПОМИНАНИЯ ======================
+function checkCommunityMention(text, groupId) {
+  const patterns = [`[club${groupId}|`, `[public${groupId}|`, `[id-${groupId}|`];
+  const lowerText = (text || '').toLowerCase();
+  return patterns.some(p => lowerText.includes(p.toLowerCase()));
+}
+
+// ====================== ПЕРЕМЕННЫЕ ======================
+async function getUserVariables(userId) {
+try {
+log('debug', `🔧 Getting user variables for ${userId}`);
+const users = await getSheetData('USERS');
+if (!users) {
+log('debug', `🔧 No users data found`);
+return {};
+}
+const user = users.find(u => u['ID'] == userId);
+if (!user) {
+log('debug', `🔧 User ${userId} not found`);
+return {};
+}
+
+// 🔥 Поддержка обоих форматов: запятые И новые строки
+// 🔥 Исправлено: корректное регулярное выражение + одно объявление
+const varNamesRaw = (user['Пользовательская'] || '');
+const varValuesRaw = (user['Значения ПП'] || '');
+
+log('debug', `🔍 Raw user vars: names="${varNamesRaw}", values="${varValuesRaw}"`);
+
+const varNames = varNamesRaw
+.split(/[\r\n,]+/)  // ✅ Корректный регексп: \r\n для Windows, \n для Unix, , для разделения
+.map(v => v.trim().toLowerCase())
+.filter(v => v);
+
+const varValues = varValuesRaw
+.split(/[\r\n,]+/)
+.map(v => v.trim())
+.filter(v => v);
+
+log('debug', `🔍 Parsed user vars:`, { names: varNames, values: varValues });
+
+const variables = {};
+for (let i = 0; i < Math.min(varNames.length, varValues.length); i++) {
+variables[varNames[i]] = varValues[i];
+}
+log('debug', `🔧 User variables for ${userId}:`, variables);
+return variables;
+} catch (error) {
+log('error', '❌ Error getting user variables:', error);
+return {};
+}
+}
+
+async function getGlobalVariables() {
+  try {
+    log('debug', `🔧 Getting global variables`);
+    const varsSheet = await getSheetData('Переменные');
+    if (!varsSheet) {
+      log('debug', `🔧 No variables sheet found`);
+      return { globalVars: {}, vkVars: {} };
+    }
+    
+    const globalVars = {};
+    const vkVars = {};
+    
+    for (const row of varsSheet) {
+      if (row['Глобальная'] && row['Значение ГП']) {
+        globalVars[row['Глобальная'].trim().toLowerCase()] = row['Значение ГП'].trim();
+      }
+      if (row['Переменные ВК'] && row['Значение/Описание ПВК']) {
+        vkVars[row['Переменные ВК'].trim().toLowerCase()] = row['Значение/Описание ПВК'].trim();
+      }
+    }
+    
+    log('debug', `🔧 Global variables:`, globalVars);
+    log('debug', `🔧 VK variables:`, vkVars);
+    return { globalVars, vkVars };
+  } catch (error) {
+    log('error', '❌ Error getting global variables:', error);
+    return { globalVars: {}, vkVars: {} };
+  }
+}
+
+async function replaceVariables(text, userId, groupId) {
+  try {
+    log('debug', `🔧 REPLACE_VARS: Starting for text: "${text}"`);
+    
+    if (!text || typeof text !== 'string') {
+      return text;
+    }
+    
+    const [userVars, { globalVars, vkVars }] = await Promise.all([
+      getUserVariables(userId),
+      getGlobalVariables()
+    ]);
+    
+    const vkStandardVars = {
+      'vk_user': userNamesCache[userId] || 'Пользователь',
+      'vk_user_id': userId,
+      'vk_group_id': groupId,
+      'vk_date': new Date().toLocaleDateString('ru-RU'),
+      'vk_time': new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+    };
+    
+    let result = text;
+    
+    // Пользовательские {$$}
+    result = result.replace(/\{\$([^}]+)\$\}/g, (_, v) => {
+      const key = v.trim().toLowerCase();
+      const value = userVars[key] !== undefined ? userVars[key] : _;
+      log('debug', `🔧 Replaced user var ${_} → ${value}`);
+      return value;
+    });
+    
+    // Глобальные [$$]
+    result = result.replace(/\[\$([^]]+)\$\]/g, (_, v) => {
+      const key = v.trim().toLowerCase();
+      const value = globalVars[key] !== undefined ? globalVars[key] : _;
+      log('debug', `🔧 Replaced global var ${_} → ${value}`);
+      return value;
+    });
+    
+    // VK переменные %%
+    result = result.replace(/%([^%]+)%/g, (_, v) => {
+      const key = v.trim().toLowerCase();
+      const value = vkVars[key] || vkStandardVars[key] || _;
+      log('debug', `🔧 Replaced VK var ${_} → ${value}`);
+      return value;
+    });
+    
+    log('debug', `🔧 REPLACE_VARS: Completed, result: "${result}"`);
+    return result;
+  } catch (error) {
+    log('error', '❌ Error in replaceVariables:', error);
+    return text;
+  }
+}
+
+// ====================== ДЕЙСТВИЯ С ПЕРЕМЕННЫМИ (НОВАЯ ВЕРСИЯ) ======================
+// ====================== ДЕЙСТВИЯ С ПЕРЕМЕННЫМИ (НОВАЯ ВЕРСИЯ) ======================
+async function performVariableActions(actions, userId, groupId) {
+    try {
+        if (!actions || typeof actions !== 'string') {
+            log('debug', `🔧 No variable actions to perform`);
+            return;
+        }
+        
+        log('debug', `🔧 Starting variable actions: "${actions}" for user ${userId}`);
+        
+        // 🔥 ПОЛУЧАЕМ переменные СРАЗУ в начале функции
+        const [userVars, { globalVars }] = await Promise.all([
+            getUserVariables(userId),
+            getGlobalVariables()
+        ]);
+        
+        // 🔥 РАЗБИВАЕМ ДЕЙСТВИЯ: поддерживаем ; и новые строки
+        const normalizedActions = actions
+            .replace(/\r\n/g, ';')      // Windows перенос
+            .replace(/\n/g, ';')         // Unix перенос
+            .replace(/\r/g, ';');        // Mac перенос
+        
+        const actionList = normalizedActions
+            .split(';')
+            .map(a => a.trim())
+            .filter(a => a.length > 0);
+        
+        const updatedUserVars = { ...userVars };
+        const updatedGlobalVars = { ...globalVars };
+        let hasUpdates = false;
+        
+        log('debug', `🔧 Current user variables:`, userVars);
+        log('debug', `🔧 Current global variables:`, globalVars);
+        log('debug', `🔥 Parsed ${actionList.length} actions`);
+        
+        for (const action of actionList) {
+            try {
+                log('debug', `🔧 Processing action: "${action}"`);
+                
+                if (!action.includes('=')) {
+                    log('debug', `⚠️ Skipping - no = sign`);
+                    continue;
+                }
+                
+                const parts = action.split('=').map(p => p.trim());
+                if (parts.length < 2) {
+                    log('debug', `⚠️ Skipping - invalid format`);
+                    continue;
+                }
+                
+                const leftSide = parts[0].trim();
+                let rightSide = parts.slice(1).join('=').trim();
+                
+                log('debug', `🔧 Action parts - left: "${leftSide}", right: "${rightSide}"`);
+                
+                // 🔥 ПРОВЕРКА: Текст в кавычках
+                let isQuotedText = false;
+                if (rightSide.startsWith('"') && rightSide.endsWith('"')) {
+                    isQuotedText = true;
+                    rightSide = rightSide.slice(1, -1);
+                    log('debug', `🔧 Quoted text detected: "${rightSide}"`);
+                }
+                
+                // 🔥 ШАГ 1: Заменяем переменные в правой части (если не кавычки)
+                if (!isQuotedText) {
+                    // Заменяем пользовательские {$...$}
+                    rightSide = rightSide.replace(/\{\$([^}]+)\$\}/g, (match, varName) => {
+                        const key = varName.trim().toLowerCase();
+                        const value = userVars[key] !== undefined ? userVars[key] :
+                                     globalVars[key] !== undefined ? globalVars[key] : '0';
+                        log('debug', `🔧 Replaced user var ${match} → "${value}"`);
+                        return value;
+                    });
+                    
+                    // Заменяем глобальные [$...$]
+                    rightSide = rightSide.replace(/\[\$([^]]+)\$\]/g, (match, varName) => {
+                        const key = varName.trim().toLowerCase();
+                        const value = globalVars[key] !== undefined ? globalVars[key] :
+                                     userVars[key] !== undefined ? userVars[key] : '0';
+                        log('debug', `🔧 Replaced global var ${match} → "${value}"`);
+                        return value;
+                    });
+                }
+                
+                let value = rightSide;
+                
+                // 🔥 Проверяем, что это математическое выражение (только цифры и операторы)
+                const mathPattern = /^[\d\s.\+\-\*\/\(\)]+$/;
+                if (mathPattern.test(rightSide.replace(/\s+/g, ''))) {
+                    try {
+                        const normalizedExpression = rightSide.replace(/,/g, '.');
+                        value = eval(normalizedExpression).toString();
+                        log('debug', `🔧 Evaluated math expression: "${rightSide}" → "${value}"`);
+                    } catch (e) {
+                        log('debug', `⚠️ Math evaluation error: ${e.message}`);
+                        value = rightSide;
+                    }
+                } else {
+                    log('debug', `🔧 Text value: "${rightSide}"`);
+                }
+                
+                // 🔥 ШАГ 2: Обрабатываем операции (если не кавычки)
+                if (!isQuotedText) {
+                    // 🔸 Склеивание &
+                    if (value.includes('&') && !value.match(/^[\d\s.\+\-\*\/\(\)]+$/)) {
+                        const concatParts = value.split('&').map(p => p.trim());
+                        value = concatParts.join('');
+                        log('debug', `🔧 Concatenation result: "${value}"`);
+                    }
+                    // 🔸 Математика + - * /
+                    else if (/^[\d\s.\+\-\*\/\(\),]+$/.test(value.replace(/\s+/g, ''))) {
+                        value = value.replace(/,/g, '.');
+                        try {
+                            const mathCheck = value.replace(/[\d.\s]/g, '');
+                            if (mathCheck.match(/^[\+\-\*\/\(\)]+$/)) {
+                                value = eval(value).toString();
+                                log('debug', `🔧 Math expression: "${value}"`);
+                            } else {
+                                value = 'null';
+                                log('debug', `⚠️ Math expression contains non-numeric characters`);
+                            }
+                        } catch (e) {
+                            value = 'null';
+                            log('debug', `⚠️ Math evaluation error: ${e.message}`);
+                        }
+                    }
+                    // 🔸 Текст без кавычек
+                    else {
+                        log('debug', `🔧 Text value: "${value}"`);
+                    }
+                }
+                
+                // 🔥 ШАГ 3: Сохраняем в переменную
+                if (leftSide.startsWith('{$') && leftSide.endsWith('$}')) {
+                    const varName = leftSide.slice(2, -2).trim().toLowerCase();
+                    updatedUserVars[varName] = value;
+                    hasUpdates = true;
+                    log('debug', `🔧 Set user var: {$${varName}$} = ${value}`);
+                } else if (leftSide.startsWith('[$') && leftSide.endsWith('$]')) {
+                    const varName = leftSide.slice(2, -2).trim().toLowerCase();
+                    updatedGlobalVars[varName] = value;
+                    hasUpdates = true;
+                    log('debug', `🔧 Set global var: [$${varName}$] = ${value}`);
+                    log('debug', `🔧 Global vars object:`, JSON.stringify(updatedGlobalVars));
+                } else {
+                    log('debug', `⚠️ Unknown variable format: "${leftSide}"`);
+                }
+                
+            } catch (e) {
+                log('error', `❌ Error processing action: "${action}"`, e);
+            }
+        }
+        
+        // 🔥 ШАГ 4: Сохраняем изменения
+        if (hasUpdates) {
+            log('debug', `🔧 Saving updated variables:`, { updatedUserVars, updatedGlobalVars });
+            await Promise.all([
+                updateUserVariables(userId, updatedUserVars),
+                updateGlobalVariables(updatedGlobalVars)
+            ]);
+            log('debug', `✅ Variable actions completed successfully`);
+        } else {
+            log('debug', `🔧 No variable updates needed`);
+        }
+        
+    } catch (error) {
+        log('error', '❌ Error performing variable actions:', error);
+    }
+}
+
+async function updateUserVariables(userId, variables) {
+    try {
+        log('debug', `🔧 Updating user variables for ${userId}:`, variables);
+        const users = await getSheetData('USERS');
+        const idx = users.findIndex(u => u['ID'] == userId);
+        if (idx === -1) {
+            log('error', `❌ User ${userId} not found in USERS sheet`);
+            return;
+        }
+        
+        const varNames = [];
+        const varValues = [];
+        for (const [name, value] of Object.entries(variables)) {
+            varNames.push(name.trim().toLowerCase());
+            varValues.push(value || '');
+            log('debug', `🔧 Set user var {$${name}$} = ${value}`);
+        }
+        
+        // 🔥 Сохраняем с новой строки (единый формат)
+// 🔥 НОВОЕ: Каждая переменная с новой строки
+users[idx]['Пользовательская'] = varNames.join('\n');
+users[idx]['Значения ПП'] = varValues.join('\n');
+log('debug', `🔍 Saved user vars:`, {
+    names: varNames.join('\n'),
+    values: varValues.join('\n')
+});
+        
+        log('debug', `🔍 Saved user vars:`, {
+            names: users[idx]['Пользовательская'],
+            values: users[idx]['Значения ПП']
+        });
+        
+        await saveSheetData('USERS', users);
+        invalidateCache('USERS');
+        log('debug', `✅ User variables updated for ${userId}`);
+        
+        // 🔥 ПРОВЕРКА: Сразу читаем обратно
+        const verifyUsers = await getSheetData('USERS');
+        const verifyUser = verifyUsers.find(u => u['ID'] == userId);
+        if (verifyUser) {
+            log('debug', `🔍 VERIFICATION: Пользовательская="${verifyUser['Пользовательская']}", Значения ПП="${verifyUser['Значения ПП']}"`);
+        }
+    } catch (error) {
+        log('error', '❌ Error updating user variables:', error);
+    }
+}
+
+async function updateGlobalVariables(variables) {
+    try {
+        log('debug', `🔧 Updating global variables:`, variables);
+        const sheet = await getSheetData('Переменные');
+        
+        for (const [name, value] of Object.entries(variables)) {
+            const normalizedName = name.trim().toLowerCase();
+            log('debug', `🔧 Searching for global var: "${normalizedName}"`);
+            
+            // 🔥 Ищем переменную в листе Переменные
+            let row = sheet.find(r => {
+                const globalName = (r['Глобальная'] || '').trim().toLowerCase();
+                log('debug', `🔍 Comparing: "${globalName}" === "${normalizedName}"`);
+                return globalName === normalizedName;
+            });
+            
+            if (row) {
+                row['Значение ГП'] = value || '';
+                log('debug', `✅ Updated existing global var [${name}] = ${value}`);
+            } else {
+                // 🔥 Создаем новую строку
+                sheet.push({ 
+                    'Пользовательская': '',
+                    'Значение ПП': '',
+                    'Глобальная': name,
+                    'Значение ГП': value || '',
+                    'Переменные ВК': '',
+                    'Значение/Описание ПВК': ''
+                });
+                log('debug', `➕ Created new global var [${name}] = ${value}`);
+            }
+        }
+        
+        await saveSheetData('Переменные', sheet);
+        invalidateCache('Переменные');
+        log('debug', `✅ Global variables saved successfully`);
+        
+        // 🔥 ПРОВЕРКА: Сразу читаем обратно для отладки
+        const verifySheet = await getSheetData('Переменные');
+        const verifyRow = verifySheet.find(r => r['Глобальная']?.trim().toLowerCase() === Object.keys(variables)[0]?.trim().toLowerCase());
+        if (verifyRow) {
+            log('debug', `🔍 VERIFICATION: [${verifyRow['Глобальная']}] = ${verifyRow['Значение ГП']}`);
+        }
+    } catch (error) {
+        log('error', '❌ Error updating global variables:', error);
+    }
+}
+
+// ====================== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ======================
+async function getUserVKName(userId) {
+  if (userNamesCache[userId]) {
+    return userNamesCache[userId];
+  }
+  
+  try {
+    if (!VK_TOKEN) {
+      log('error', 'VK_TOKEN is not set!');
+      return null;
+    }
+    
+    const response = await axios.get('https://api.vk.com/method/users.get', {
+      params: {
+        user_ids: userId,
+        access_token: VK_TOKEN,
+        v: '5.199'
+      }
+    });
+    
+    if (response.data?.response?.length > 0) {
+      const user = response.data.response[0];
+      const name = `${user.first_name} ${user.last_name}`;
+      userNamesCache[userId] = name;
+      return name;
+    }
+    return null;
+  } catch (error) {
+    log('error', 'Error getting user name from VK:', error);
+    return null;
+  }
+}
+
+async function updateUserData(userId) {
+  try {
+    log('debug', `👤 STEP 1: Starting updateUserData for ${userId}`);
+    
+    const userName = await getUserVKName(userId);
+    if (!userName) {
+      log('debug', `❌ Failed to get user name for ${userId}`);
+      return false;
+    }
+    
+    log('debug', `✅ STEP 2: Got user name: ${userName}`);
+    
+    log('debug', `🔄 STEP 3: Loading USERS data`);
+    invalidateCache('USERS');
+    const users = await getSheetData('USERS') || [];
+    
+    log('debug', `📊 Total users in database: ${users.length}`);
+    
+    const existingUser = users.find(u => u['ID'] == userId);
+    if (existingUser) {
+      log('debug', `✅ STEP 4: User ${userId} already exists in database`);
+      return true;
+    }
+    
+    log('debug', `❌ STEP 4: User ${userId} not found, adding to database...`);
+    
+    const success = await addNewUserToSheet(userId, userName);
+    if (success) {
+      log('debug', `✅ STEP 5: User ${userId} successfully added to database`);
+      log('debug', `🔄 STEP 6: Refreshing USERS cache after addition`);
+      invalidateCache('USERS');
+      await getSheetData('USERS');
+      return true;
+    } else {
+      log('debug', `❌ STEP 5: Failed to add user ${userId} to database`);
+      return false;
+    }
+  } catch (error) {
+    log('error', '❌ Error in updateUserData:', error);
+    return false;
+  }
+}
+
+async function addNewUserToSheet(userId, userName) {
+  try {
+    log('debug', `📝 SIMPLE ADD: Adding user ${userId} - ${userName}`);
+    
+    const users = await getSheetData('USERS') || [];
+    
+    users.push({
+      'ID': userId.toString(),
+      'ИМЯ': userName,
+      'ГРУППА': '',
+      'Пользовательская': '',
+      'Значения ПП': '',
+      'Текущий Бот': '',
+      'Текущий Шаг': ''
+    });
+    
+    await saveSheetData('USERS', users);
+    log('debug', `✅ User ${userId} added to sheet`);
+    return true;
+  } catch (error) {
+    log('error', '❌ Error adding user to sheet:', error.message);
+    return false;
+  }
+}
+
+async function updateUserGroups(userId, addGroupsStr = '', removeGroupsStr = '') {
+  try {
+    log('debug', `👥 Updating groups for user ${userId}: add="${addGroupsStr}", remove="${removeGroupsStr}"`);
+    
+    const users = await getSheetData('USERS');
+    const userRow = users.find(r => r['ID'] == userId);
+    
+    if (!userRow) {
+      log('error', `❌ User ${userId} not found in USERS sheet`);
+      return;
+    }
+    
+    const currentGroups = (userRow['ГРУППА'] || '').split(',').map(g => g.trim()).filter(g => g);
+    log('debug', `👥 Current groups: [${currentGroups}]`);
+    
+    const removeGroups = removeGroupsStr.split(',').map(g => g.trim()).filter(g => g);
+    let newGroups = currentGroups.filter(group => !removeGroups.includes(group));
+    log('debug', `👥 After removal: [${newGroups}]`);
+    
+    const addGroups = addGroupsStr.split(',').map(g => g.trim()).filter(g => g);
+    addGroups.forEach(group => {
+      if (!newGroups.includes(group)) {
+        newGroups.push(group);
+      }
+    });
+    log('debug', `👥 After addition: [${newGroups}]`);
+    
+    // 🔥 НОВОЕ: Каждая группа с новой строки
+userRow['ГРУППА'] = newGroups.join('\n');
+    
+    await saveSheetData('USERS', users);
+    invalidateCache('USERS');
+    log('debug', `✅ Groups updated for user ${userId}: ${newGroups.join(',')}`);
+  } catch (error) {
+    log('error', '❌ Error updating user groups:', error);
+  }
+}
+
+async function updateUserBotAndStep(userId, bot, step) {
+    try {
+        log('debug', `🤖 Saving bot and step: bot="${bot}", step="${step}" for user ${userId}`);
+        const users = await getSheetData('USERS');
+        const userRow = users.find(r => r['ID'] == userId);
+        if (!userRow) {
+            log('error', `❌ User ${userId} not found in USERS sheet`);
+            return;
+        }
+        
+        // 🔥 Читаем текущие значения
+        const currentBotsRaw = userRow['Текущий Бот'] || '';
+        const currentStepsRaw = userRow['Текущий Шаг'] || '';
+        
+        log('debug', `🔍 Current bots: "${currentBotsRaw}", steps: "${currentStepsRaw}"`);
+        
+        // 🔥 Разбиваем на массивы (поддержка \n)
+        const currentBots = currentBotsRaw ? currentBotsRaw.split('\n').map(b => b.trim()).filter(b => b) : [];
+        const currentSteps = currentStepsRaw ? currentStepsRaw.split('\n').map(s => s.trim()).filter(s => s) : [];
+        
+        // 🔥 Находим индекс бота
+        let botIndex = currentBots.findIndex(b => b === bot);
+        
+        if (botIndex === -1) {
+            // 🔥 Новый бот - добавляем
+            currentBots.push(bot);
+            currentSteps.push(step);
+            log('debug', `➕ Added new bot "${bot}" with step "${step}"`);
+        } else {
+            // 🔥 Бот существует - добавляем шаг к истории
+            const prevSteps = currentSteps[botIndex] || '';
+            currentSteps[botIndex] = prevSteps ? `${prevSteps}>${step}` : step;
+            log('debug', `📝 Updated bot "${bot}" steps: "${currentSteps[botIndex]}"`);
+        }
+        
+        // 🔥 Сохраняем с новой строки
+        // 🔥 Каждый бот и шаг с новой строки
+userRow['Текущий Бот'] = currentBots.join('\n');
+userRow['Текущий Шаг'] = currentSteps.join('\n');
+log('debug', `✅ Bot and step saved:`, {
+    bots: currentBots,
+    steps: currentSteps,
+    raw_bots: currentBots.join('\n'),
+    raw_steps: currentSteps.join('\n')
+});
+        
+        log('debug', `💾 Saved: bots="${userRow['Текущий Бот']}", steps="${userRow['Текущий Шаг']}"`);
+        
+        await saveSheetData('USERS', users);
+        invalidateCache('USERS');
+        
+        log('debug', `✅ Bot and step saved for user ${userId}:`, {
+            bots: currentBots,
+            steps: currentSteps
+        });
+        
+        // 🔥 ПРОВЕРКА: Сразу читаем обратно
+        const verifyUsers = await getSheetData('USERS');
+        const verifyUser = verifyUsers.find(u => u['ID'] == userId);
+        if (verifyUser) {
+            log('debug', `🔍 VERIFICATION: Текущий Бот="${verifyUser['Текущий Бот']}", Текущий Шаг="${verifyUser['Текущий Шаг']}"`);
+        }
+    } catch (error) {
+        log('error', '❌ Error updating user bot and step:', error);
+    }
+}
+
+// ====================== КЛАВИАТУРЫ ======================
+// ====================== КЛАВИАТУРЫ ======================
+function createKeyboard(row, prefix = 'Кнопка Ответа', linkPrefix = 'Цвет/Ссылка Ответа', maxButtons = 10) {
+    try {
+        // 🔥 НОВОЕ: Проверка типа клавиатуры из колонки "Кнопки в sms"
+        const inlineSetting = (row['Кнопки в sms'] || 'ДА').trim().toUpperCase();
+        const isInline = (inlineSetting === 'ДА');
+        
+        const buttons = [];
+        
+        for (let i = 1; i <= maxButtons; i++) {
+            const btnText = (row[`${prefix}-${i}`] || '').trim();
+            const btnLinkOrColor = (row[`${linkPrefix}-${i}`] || '').trim();
+            
+            if (!btnText) continue;
+            
+            let button = null;
+            
+            // 🔥 Разделяем цвет и ссылку (формат: "цвет||ссылка" или просто "цвет")
+            const parts = (btnLinkOrColor || '').split('||');
+            const colorValue = parts[0] || '';
+            const linkValue = parts[1] || '';
+            
+            // 🔥 Нормализация: убираем пробелы, заменяем "ё" на "е", приводим к нижнему регистру
+            const normalizedColor = colorValue.toLowerCase().replace(/ё/ig, 'е').trim();
+            
+            // 🔥 Проверяем, это ссылка или цвет
+            if (normalizedColor === 'ссылка...' || linkValue.trim().startsWith('http')) {
+                // 🔗 Кнопка-ссылка
+                button = {
+                    action: {
+                        type: 'open_link',
+                        link: linkValue.trim() || colorValue.trim(),
+                        label: btnText.trim()
+                    }
+                };
+                log('debug', `🔗 Link button: "${btnText}" → ${linkValue || colorValue}`);
+                
+            } else {
+                // 🔘 Цветная кнопка
+                let color = 'secondary';
+                
+                // 🔥 Поддержка всех форм слов + нормализация "ё" → "е"
+                // Красный: красный, красная, красное, красные, красн, negative, red
+                if (/^красн/.test(normalizedColor) || normalizedColor === 'negative' || normalizedColor === 'red') {
+                    color = 'negative';
+                }
+                // Зелёный: зеленый, зелёный, зеленая, зелёная, зеленое, зелёное, зеленые, зелёные, зелен, зелё, позитив, positive, green
+                else if (/^зелен/.test(normalizedColor) || /^зелён/.test(normalizedColor) || normalizedColor === 'positive' || normalizedColor === 'green') {
+                    color = 'positive';
+                }
+                // Синий: синий, синяя, синее, синие, син, первичный, primary, blue
+                else if (/^син/.test(normalizedColor) || normalizedColor === 'primary' || normalizedColor === 'blue') {
+                    color = 'primary';
+                }
+                // Белый: белый, белая, белое, белые, бел, белый, white
+                else if (/^бел/.test(normalizedColor) || normalizedColor === 'white') {
+                    color = 'secondary';
+                }
+                // Серый: серый, серая, серое, серые, сер, серый, серый, gray, grey
+                else if (/^сер/.test(normalizedColor) || normalizedColor === 'gray' || normalizedColor === 'grey') {
+                    color = 'secondary';
+                }
+                
+                button = {
+                    action: {
+                        type: 'text',
+                        label: btnText.trim(),
+                        payload: JSON.stringify({ button: i })
+                    },
+                    color: color
+                };
+                
+                log('debug', `🔘 Button "${btnText}" color: "${normalizedColor}" → VK color: "${color}"`);
+            }
+            
+            if (button) {
+                buttons.push([button]);
+            }
+        }
+        
+        if (buttons.length > 0) {
+            const keyboard = {
+                one_time: false,
+                inline: true,
+                buttons: buttons
+            };
+            log('debug', `Created keyboard with ${buttons.length} buttons`);
+            return keyboard;
+        }
+        
+        return null;
+        
+    } catch (error) {
+        log('error', 'Error creating keyboard:', error);
+        return null;
+    }
+}
+
+// ====================== ОТПРАВКА СООБЩЕНИЙ (ИСПРАВЛЕННАЯ) ======================
+async function sendMessageVK(userId, text, keyboard = null, groupId = '-229445618') {
+  try {
+    log('debug', `📤 Sending message to ${userId}`);
+    
+    const params = new URLSearchParams({
+      user_id: userId,
+      message: text,
+      random_id: Math.floor(Math.random() * 1e7),
+      v: '5.199',
+      access_token: VK_TOKEN
+    });
+    
+    // 🔥 ИСПРАВЛЕНИЕ: НЕ используем reply_to для сообщений сообщества
+    // Это вызывает ошибку "reply_to have to be message from same chat"
+    
+    if (keyboard) {
+      params.append('keyboard', JSON.stringify(keyboard));
+    }
+    
+    log('debug', `🚀 Sending to VK API...`);
+    
+    const response = await axios.post(
+      'https://api.vk.com/method/messages.send',
+      params,
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        timeout: 10000
+      }
+    );
+    
+    if (response.data.error) {
+      log('error', '❌ VK API Error:', response.data.error);
+      return false;
+    } else {
+      log('debug', `✅ MESSAGE SENT SUCCESSFULLY to ${userId}`);
+      return true;
+    }
+  } catch (error) {
+    log('error', '❌ Error sending message:', error.response?.data || error.message);
+    return false;
+  }
+}
+
+async function sendCommentVK(ownerId, postId, text, replyTo = null) {
+  try {
+    log('debug', `💬 Sending comment to post ${postId}`);
+    
+    const params = new URLSearchParams({
+      owner_id: ownerId,
+      post_id: postId,
+      message: text,
+      v: '5.199',
+      access_token: VK_TOKEN
+    });
+    
+    if (replyTo) {
+      params.append('reply_to_comment', replyTo);
+    }
+    
+    const response = await axios.post(
+      'https://api.vk.com/method/wall.createComment',
+      params,
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        timeout: 5000
+      }
+    );
+    
+    if (response.data.error) {
+      log('error', '❌ VK API Error for comment:', response.data.error);
+      return false;
+    } else {
+      log('debug', `✅ Comment sent successfully`);
+      return true;
+    }
+  } catch (error) {
+    log('error', '❌ Error sending comment:', error);
+    return false;
+  }
+}
+
+// ====================== ДЕЙСТВИЯ СТРОКИ ======================
+async function performRowActions(row, userId, groupId, isComment = false) {
+    try {
+        log('debug', `🛠️ Performing FULL row actions for user ${userId}`);
+        
+        // 🔥 ОТЛАДКА: Выводим все значения из строки
+        log('debug', `📊 Row data:`, {
+            'ДОБАВИТЬ ГРУППУ': row['ДОБАВИТЬ ГРУППА'],
+            'ГРУППА': row['ГРУППА'],
+            'УДАЛИТЬ ГРУППУ': row['УДАЛИТЬ ГРУППУ'],
+            'Отправить на Шаг': row['Отправить на Шаг'],
+            'Задержка отправки на Шаг': row['Задержка отправки на Шаг'],
+            'Действия с ПП/ГП/ПВК': row['Действия с ПП/ГП/ПВК']
+        });
+        
+        // 1. Обновление бота и шага
+        const bot = (row['Бот'] || '').trim();
+        const step = (row['Шаг'] || '').trim();
+        
+    if (bot && step) {
+      log('debug', `🤖 Setting bot: "${bot}", step: "${step}"`);
+      await updateUserBotAndStep(userId, bot, step);
+    }
+    
+// 2. Добавление групп (🔥 ИСПРАВЛЕНИЕ: новое имя колонки)
+const addGroups = (row['ДОБАВИТЬ ГРУППУ'] || row['ГРУППА'] || '').trim();
+if (addGroups) {
+    log('debug', `➕ Adding groups: "${addGroups}"`);
+    await updateUserGroups(userId, addGroups, '');
+}
+// 3. Удаление групп
+const removeGroups = (row['УДАЛИТЬ ГРУППУ'] || '').trim();
+if (removeGroups) {
+    log('debug', `➖ Removing groups: "${removeGroups}"`);
+    await updateUserGroups(userId, '', removeGroups);
+}
+// 4. Действия с переменными (🔥 ИСПРАВЛЕНИЕ: новые имена колонок)
+const variableActions = (row['Действия с ПП/ГП/ПВК'] || '').trim();
+if (variableActions) {
+    log('debug', `🔧 Performing variable actions: "${variableActions}"`);
+    await performVariableActions(variableActions, userId, groupId);
+}
+// 5. Отправка на шаг с задержкой (🔥 ИСПРАВЛЕНИЕ: новые имена колонок)
+const sendToStep = (row['Отправить на Шаг'] || '').trim();
+const delayStr = (row['Задержка отправки на Шаг'] || '').trim();
+
+    if (sendToStep && delayStr) {
+    const stepData = sendToStep + ',' + delayStr;
+    log('debug', `⏰ Scheduling step: "${stepData}"`);
+    await scheduleStepMessage(userId, groupId, stepData, isComment);
+    } else if (sendToStep) {
+    // Если задержка не указана, используем 0
+    const stepData = sendToStep + ',0';
+    log('debug', `⏰ Scheduling step without delay: "${stepData}"`);
+    await scheduleStepMessage(userId, groupId, stepData, isComment);
+    }
+    
+    log('debug', `✅ All row actions completed for user ${userId}`);
+  } catch (error) {
+    log('error', '❌ Error performing row actions:', error);
+  }
+}
+
+async function scheduleStepMessage(userId, groupId, stepData, isComment = false) {
+    try {
+        const [step, delayStr] = stepData.split(',').map(s => s.trim());
+        const delay = parseDelay(delayStr);
+        log('debug', `⏰ Scheduling step: "${stepData}" → step="${step}", delay=${delay}sec`);
+        if (delay > 0 && step) {
+            log('debug', `⏰ Scheduling step ${step} for user ${userId} in ${delay} seconds`);
+            const scheduledTime = new Date(Date.now() + delay * 1000);
+            const delayed = await getSheetData('Отложенные');
+            delayed.push({
+                '№': (delayed.length + 1).toString(),
+                'Шаг': step,
+                'ID Пользователя': userId.toString(),
+                'Группа': groupId.toString(),
+                'Тип': isComment ? 'comment' : 'message',
+                'Дата и время отправки': scheduledTime.toISOString().replace('T', ' ').substring(0, 19),
+                'Статус': 'Ожидает',
+                'Фактическое время отправки': '',
+                'Ошибка': ''
+            });
+            await saveSheetData('Отложенные', delayed);
+            invalidateCache('Отложенные');
+            log('debug', `✅ Step ${step} saved to delayed for ${userId}`);
+        } else {
+            log('warn', `⚠️ Step NOT scheduled: delay=${delay}, step="${step}"`);
+        }
+    } catch (error) {
+        log('error', '❌ Error scheduling step message:', error);
+    }
+}
+
+
+// ====================== ОБРАБОТКА ОТЛОЖЕННЫХ ======================
+
+async function processDelayed() {
+    try {
+        const delayed = await getSheetData('Отложенные');
+        const messages = await getSheetData('MESSAGES COMMUNITY');
+        const comments = await getSheetData('COMMENTS');
+        const now = new Date();
+        let hasChanges = false;
+
+        for (const item of delayed) {
+            if (item['Статус'] !== 'Ожидает') continue;
+
+            const scheduledTime = new Date(item['Дата и время отправки']);
+            if (scheduledTime > now) continue;
+
+            const userId = item['ID Пользователя'];
+            const groupId = item['Группа'];
+            const stepName = item['Шаг'];
+            const type = item['Тип'] || 'message';
+
+            const rows = type === 'comment' ? comments : messages;
+            const row = rows.find(r => (r['Шаг'] || '').trim() === stepName);
+
+          if (row) {
+              const answer = row['Ответ'] || '';
+              const processedAnswer = await replaceVariables(answer, userId, groupId);
+              
+              try {
+                  const keyboard = createKeyboard(row, 'Кнопка Ответа', 'Цвет/Ссылка Ответа');
+                  await sendMessageVK(userId, processedAnswer, keyboard, groupId);
+                  
+                  // 🔥 НОВОЕ: Выполняем действия из строки шага
+                  log('debug', `🛠️ Executing actions from step ${stepName}`);
+                  await performRowActions(row, userId, groupId, type === 'comment');
+                  
+                  item['Статус'] = 'Отправлено';
+                  item['Фактическое время отправки'] = now.toISOString().replace('T', ' ').substring(0, 19);
+                  log('debug', `✅ Sent delayed step ${stepName} to ${userId} with actions`);
+                  hasChanges = true;
+              } catch (sendError) {
+                  item['Статус'] = 'Ошибка';
+                  item['Ошибка'] = sendError.message;
+                  log('error', `❌ Error sending delayed step ${stepName}:`, sendError.message);
+                  hasChanges = true;
+              }
+          }
+        }
+
+        if (hasChanges) {
+            await saveSheetData('Отложенные', delayed);
+            invalidateCache('Отложенные');
+            log('debug', `💾 Saved delayed changes`);
+        }
+    } catch (error) {
+        log('error', '❌ Error in processDelayed:', error);
+    }
+}
+
+
+function parseDelay(delayStr) {
+if (!delayStr) return 0;
+const str = delayStr.trim().toLowerCase();
+const value = parseInt(str) || 0;
+// Часы
+if (str.includes('ч.') || str.includes('часов') || str.includes('часа') || str.includes('час')) {
+return value * 3600;
+}
+// Минуты
+if (str.includes('мин.') || str.includes('минут') || str.includes('минуту') || str.includes('мин')) {
+return value * 60;
+}
+// Секунды (по умолчанию)
+return value;
+}
+
+// ====================== ОБРАБОТКА СООБЩЕНИЙ ======================
+async function handleMessage(data) {
+  try {
+    const message = data.object.message;
+    const text = (message.text || '').trim();
+    const userId = message.from_id;
+    const groupId = data.group_id;
+    
+    log('info', `📨 ========== NEW MESSAGE ==========`);
+    log('info', `📨 From: ${userId}, Text: "${text}"`);
+    
+    // Проверка дублирования
+    const messageKey = `msg_${userId}_${message.conversation_message_id || message.id}`;
+    if (processedMessages.has(messageKey)) {
+      log('debug', `⚠️ Message already processed: ${messageKey}`);
+      return;
+    }
+    processedMessages.set(messageKey, Date.now());
+    
+    if (!VK_TOKEN) {
+      log('error', '❌ VK_TOKEN is not set!');
+      return;
+    }
+    
+    // ШАГ 1: Обновляем данные пользователя
+    log('debug', `👤 STEP 1: Starting updateUserData for ${userId}`);
+    const userUpdated = await updateUserData(userId);
+    if (!userUpdated) {
+      log('debug', `⚠️ User ${userId} not in database, but continuing processing...`);
+    } else {
+      log('debug', `✅ User data updated successfully`);
+    }
+    
+    // ШАГ 2: Загружаем сообщения
+    log('debug', `📋 STEP 2: Loading MESSAGES COMMUNITY data`);
+    const messages = await getSheetData('MESSAGES COMMUNITY');
+    if (!messages) {
+      log('error', `❌ STEP 2 FAILED: No messages data loaded`);
+      return;
+    }
+    log('debug', `✅ STEP 2 COMPLETED: Loaded ${messages.length} message rules`);
+    
+    // ДИАГНОСТИКА: Выводим все триггеры
+    log('debug', `🔍 ALL TRIGGERS:`);
+    messages.forEach((row, index) => {
+      const trigger = (row['Триггер'] || '').trim();
+      if (trigger) {
+        log('debug', `   [${index}] "${trigger}" → "${(row['Ответ'] || '').substring(0, 50)}..."`);
+      }
+    });
+    
+    let matchedRowWithConditions = null;
+    let matchedRowWithoutConditions = null;
+    let fallbackRow = null;
+    
+    log('debug', `🔍 STEP 3: Starting search through ${messages.length} rows...`);
+    
+    // ПРОХОДИМ ПО КАЖДОЙ СТРОКЕ
+    for (let i = 0; i < messages.length; i++) {
+      const row = messages[i];
+      const trigger = (row['Триггер'] || '').trim();
+      const answer = (row['Ответ'] || '').trim();
+      const fallbackAnswer = (row['Заготовленный ответ'] || '').trim();
+      
+      log('debug', `\n🔍 [Row ${i}] Checking: trigger="${trigger}"`);
+      
+      // Запоминаем строку с заготовленным ответом (без триггера)
+      if (!trigger && fallbackAnswer) {
+        log('debug', `⭐ [Row ${i}] Found GENERAL FALLBACK row`);
+        fallbackRow = row;
+        continue;
+      }
+      
+      // Пропускаем строки без триггера
+      if (!trigger) {
+        log('debug', `➡️ [Row ${i}] Skipping - no trigger`);
+        continue;
+      }
+      
+      // Проверяем совпадение триггера
+      log('debug', `🔍 [Row ${i}] Checking trigger: "${trigger}" vs user text: "${text}"`);
+      const matchType = (row['Точно/Не точно'] || '').trim().toUpperCase();
+      const caseSensitive = (row['Регистр'] || '').trim().toLowerCase() === 'важно';
+      const triggerMatch = await checkTriggerMatch(text, trigger, matchType, caseSensitive, userId, groupId);
+      
+      if (triggerMatch) {
+        log('debug', `✅ [Row ${i}] Trigger "${trigger}" MATCHED!`);
+        
+        // Проверяем условия
+        log('debug', `🔍 [Row ${i}] Checking conditions...`);
+        const conditionsMet = await checkAllConditions(row, {
+          userId: userId,
+          groupId: groupId,
+          text: text,
+          eventType: 'message'
+        });
+        
+        if (conditionsMet) {
+          log('debug', `🎯 [Row ${i}] ALL CONDITIONS MET!`);
+          log('debug', `🎯 [Row ${i}] Answer found: "${answer}"`);
+          matchedRowWithConditions = row;
+          break;
+        } else {
+          log('debug', `❌ [Row ${i}] Conditions not met`);
+          if (fallbackAnswer && !matchedRowWithoutConditions) {
+            log('debug', `💾 [Row ${i}] Storing as fallback candidate`);
+            matchedRowWithoutConditions = row;
+          }
+        }
+      } else {
+        log('debug', `❌ [Row ${i}] Trigger "${trigger}" NOT matched`);
+      }
+    }
+    
+    // ШАГ 4: Принятие решения об ответе
+    log('debug', `\n📤 STEP 4: DECISION MAKING`);
+    log('debug', `   - Matched with conditions: ${matchedRowWithConditions ? 'YES' : 'NO'}`);
+    log('debug', `   - Matched without conditions: ${matchedRowWithoutConditions ? 'YES' : 'NO'}`);
+    log('debug', `   - General fallback: ${fallbackRow ? 'YES' : 'NO'}`);
+    
+    if (matchedRowWithConditions) {
+      log('debug', `🚀 STEP 4.1: SENDING MAIN RESPONSE`);
+      await sendMessageAndPerformActions(userId, matchedRowWithConditions, message, false);
+    } else if (matchedRowWithoutConditions) {
+      log('debug', `🚀 STEP 4.2: SENDING FALLBACK FROM TRIGGER ROW`);
+      await sendFallbackResponseFromRow(userId, matchedRowWithoutConditions, message);
+    } else if (fallbackRow) {
+      log('debug', `🚀 STEP 4.3: SENDING GENERAL FALLBACK`);
+      await sendFallbackResponseFromRow(userId, fallbackRow, message);
+    } else {
+      log('debug', `🚀 STEP 4.4: SENDING DEFAULT RESPONSE`);
+      await sendDefaultResponse(userId, message);
+    }
+    
+    log('info', `✅ ========== MESSAGE PROCESSING COMPLETE ==========`);
+  } catch (error) {
+    log('error', '❌ CRITICAL ERROR in handleMessage:', error);
+    log('error', error.stack);
+  }
+}
+
+async function sendMessageAndPerformActions(userId, row, originalMessage, isComment = false) {
+  try {
+    log('debug', `📤 START: sendMessageAndPerformActions for user ${userId}`);
+    
+    const answer = (row['Ответ'] || '').trim();
+    const groupId = originalMessage.group_id || '-229445618';
+    
+    log('debug', `📤 Original answer: "${answer}"`);
+    
+    const processedAnswer = await replaceVariables(answer, userId, groupId);
+    log('debug', `📤 Processed answer: "${processedAnswer}"`);
+    
+    // 🔥 ИСПРАВЛЕНИЕ: НЕ используем reply_to
+    const keyboard = !isComment ? createKeyboard(row, 'Кнопка Ответа', 'Цвет/Ссылка Ответа') : null;
+    
+    const success = await sendMessageVK(userId, processedAnswer, keyboard, groupId);
+    
+    if (success) {
+      await performRowActions(row, userId, groupId, isComment);
+    }
+    
+    log('debug', `✅ END: sendMessageAndPerformActions completed`);
+  } catch (error) {
+    log('error', '❌ Error in sendMessageAndPerformActions:', error);
+  }
+}
+
+async function sendFallbackResponseFromRow(userId, row, originalMessage) {
+  try {
+    const fallbackAnswer = (row['Заготовленный ответ'] || '').trim();
+    
+    if (!fallbackAnswer) {
+      log('debug', `❌ No fallback answer in row, sending default`);
+      await sendDefaultResponse(userId, originalMessage);
+      return;
+    }
+    
+    const groupId = originalMessage.group_id || '-229445618';
+    const processedAnswer = await replaceVariables(fallbackAnswer, userId, groupId);
+    
+    log('debug', `📤 Sending fallback: "${processedAnswer}"`);
+    
+    // 🔥 ИСПРАВЛЕНИЕ: НЕ используем reply_to
+    const keyboard = createKeyboard(row, 'Кнопка ЗО', 'Цвет/Ссылка ЗО');
+    
+    await sendMessageVK(userId, processedAnswer, keyboard, groupId);
+    log('debug', `✅ Fallback sent successfully to ${userId}`);
+  } catch (error) {
+    log('error', '❌ Error sending fallback:', error);
+  }
+}
+
+async function sendDefaultResponse(userId, originalMessage) {
+  try {
+    const defaultText = "Извините, я не понял ваш запрос. Обратитесь к администратору.";
+    
+    log('debug', `📤 Sending default response to ${userId}`);
+    
+    // 🔥 ИСПРАВЛЕНИЕ: НЕ используем reply_to
+    //await sendMessageVK(userId, defaultText, null, originalMessage.group_id || '-229445618');
+    log('debug', `✅ Default response sent to ${userId}`);
+  } catch (error) {
+    log('error', '❌ Error sending default response:', error);
+  }
+}
+
+// ====================== ОБРАБОТКА КОММЕНТАРИЕВ ======================
+async function handleComment(data) {
+    try {
+        const comment = data.object;
+        // 🔥 ИСПРАВЛЕНИЕ: Очищаем текст от упоминаний сообщества
+        let text = (comment.text || '').trim();
+        text = text.replace(/\[club\d+\|[^\]]*\]/gi, '')
+                   .replace(/\[public\d+\|[^\]]*\]/gi, '')
+                   .replace(/@club\d+/gi, '')
+                   .replace(/@public\d+/gi, '')
+                   .trim();
+        const userId = comment.from_id;
+        const groupId = data.group_id;
+    
+    if (userId < 0) {
+      log('debug', `💬 Comment from community, skipping`);
+      return;
+    }
+    
+    log('info', `💬 New comment from ${userId}: ${text}`);
+    
+    // Проверка дублирования
+    const commentKey = `comment_${comment.id}`;
+    if (processedMessages.has(commentKey)) {
+      log('debug', `⚠️ Comment already processed: ${commentKey}`);
+      return;
+    }
+    processedMessages.set(commentKey, Date.now());
+    
+    const postIdentifier = `-${groupId}_${comment.post_id}`;
+    
+    await updateUserData(userId);
+    
+    const comments = await getSheetData('COMMENTS');
+    if (!comments) {
+      log('error', `❌ Failed to load comments data`);
+      return;
+    }
+    
+    let matchedRowWithConditions = null;
+    let matchedRowWithoutConditions = null;
+    let fallbackRow = null;
+    
+    for (let i = 0; i < comments.length; i++) {
+      const row = comments[i];
+      const trigger = (row['Триггер'] || '').trim();
+      const answer = (row['Ответ'] || '').trim();
+      const fallbackAnswer = (row['Заготовленный ответ'] || '').trim();
+      
+      if (!trigger && fallbackAnswer) {
+        fallbackRow = row;
+        continue;
+      }
+      
+      if (trigger) {
+        const matchType = (row['Точно/Не точно'] || '').trim().toUpperCase();
+        const caseSensitive = (row['Регистр'] || '').trim().toLowerCase() === 'важно';
+        const triggerMatch = await checkTriggerMatch(text, trigger, matchType, caseSensitive, userId, groupId);
+        
+        if (triggerMatch) {
+          log('debug', `✅ Comment trigger matched: "${trigger}"`);
+          
+          const conditionsMet = await checkAllConditions(row, {
+            userId: userId,
+            groupId: groupId,
+            text: text,
+            postId: postIdentifier,
+            commentText: text,
+            eventType: 'comment'
+          });
+          
+          if (conditionsMet) {
+            log('debug', `✅ All conditions met for comment trigger: "${trigger}"`);
+            matchedRowWithConditions = row;
+            break;
+          } else {
+            log('debug', `❌ Conditions not met for comment trigger: "${trigger}"`);
+            if (fallbackAnswer && !matchedRowWithoutConditions) {
+              matchedRowWithoutConditions = row;
+            }
+          }
+        }
+      }
+    }
+    
+    if (matchedRowWithConditions) {
+      await sendCommentAndPerformActions(comment, groupId, matchedRowWithConditions, true);
+    } else if (matchedRowWithoutConditions) {
+      await sendFallbackCommentFromRow(comment, groupId, matchedRowWithoutConditions);
+    } else if (fallbackRow) {
+      await sendFallbackCommentFromRow(comment, groupId, fallbackRow);
+    }
+  } catch (error) {
+    log('error', 'Comment handling error:', error);
+  }
+}
+
+async function sendCommentAndPerformActions(comment, groupId, row, isComment = true) {
+  try {
+    const answer = (row['Ответ'] || '').trim();
+    const processedAnswer = await replaceVariables(answer, comment.from_id, `-${groupId}`);
+    const replyText = `@id${comment.from_id} ${processedAnswer}`;
+    
+    log('debug', `💬 Sending comment reply to ${comment.from_id}`);
+    
+    const success = await sendCommentVK(-groupId, comment.post_id, replyText, comment.id);
+    
+    if (success) {
+      await performRowActions(row, comment.from_id, `-${groupId}`, true);
+    }
+  } catch (error) {
+    log('error', '❌ Error sending comment:', error);
+  }
+}
+
+async function sendFallbackCommentFromRow(comment, groupId, row) {
+  try {
+    const fallbackAnswer = (row['Заготовленный ответ'] || '').trim();
+    if (!fallbackAnswer) return;
+    
+    const processedAnswer = await replaceVariables(fallbackAnswer, comment.from_id, `-${groupId}`);
+    const replyText = `@id${comment.from_id} ${processedAnswer}`;
+    
+    log('debug', `💬 Sending fallback comment to ${comment.from_id}`);
+    
+    await sendCommentVK(-groupId, comment.post_id, replyText, comment.id);
+    log('debug', `✅ Fallback comment sent successfully`);
+  } catch (error) {
+    log('error', '❌ Error sending fallback comment:', error);
+  }
+}
+
+
+// Генерация колонок для кнопок ответа с разделами
+function generateAnswerButtonColumns(startIdx, endIdx) {
+    const cols = [];
+    const colors = ['th-blue-1','th-blue-2','th-blue-3','th-purple-1','th-purple-2','th-teal-1','th-teal-2','th-red-1','th-red-2','th-cyan'];
+    
+    for (let i = startIdx; i <= endIdx; i++) {
+        const colorIdx = (i - 1) % colors.length;
+        cols.push({ 
+            name: `Кнопка Ответа-${i}`, 
+            class: colors[colorIdx], 
+            hint: 'Текст кнопки ' + i,
+            section: 'КНОПКИ В ОТВЕТЕ'
+        });
+        cols.push({ 
+            name: `Цвет/Ссылка Ответа-${i}`, 
+            class: colors[colorIdx], 
+            type: 'select', 
+            options: ['красный','зелёный','синий','белый','ССЫЛКА...'], 
+            hint: 'Цвет или ссылка',
+            section: 'КНОПКИ В ОТВЕТЕ'
+        });
+    }
+    return cols;
+}
+
+// Генерация колонок для кнопок ЗО с разделами
+function generateFallbackButtonColumns(startIdx, endIdx) {
+    const cols = [];
+    const colors = ['th-indigo','th-purple-1','th-purple-2','th-teal-1','th-teal-2','th-red-1','th-red-2','th-cyan','th-blue-1','th-blue-2'];
+    
+    for (let i = startIdx; i <= endIdx; i++) {
+        const colorIdx = (i - 1) % colors.length;
+        cols.push({ 
+            name: `Кнопка ЗО-${i}`, 
+            class: colors[colorIdx], 
+            hint: 'Текст кнопки ЗО ' + i,
+            section: 'КНОПКИ В ЗАГОТОВЛЕННОМ ОТВЕТЕ'
+        });
+        cols.push({ 
+            name: `Цвет/Ссылка ЗО-${i}`, 
+            class: colors[colorIdx], 
+            type: 'select', 
+            options: ['красный','зелёный','синий','белый','ССЫЛКА...'], 
+            hint: 'Цвет или ссылка',
+            section: 'КНОПКИ В ЗАГОТОВЛЕННОМ ОТВЕТЕ'
+        });
+    }
+    return cols;
+}
+
+// Добавляем колонку удаления
+function getDeleteColumn() {
+    return { name: 'Удалить строку', class: 'th-red-1', hint: 'Удалить строку', section: 'УДАЛЕНИЕ' };
+}
+
+
+
+// ====================== АДМИН-ПАНЕЛЬ С ПОДСКАЗКАМИ И РАЗДЕЛАМИ ======================
+
+const adminPanelHTML = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>🤖 Админ-панель Большого Бота</title>
+<style>
+* { box-sizing: border-box; }
+body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; font-size: 13px; }
+.container { max-width: 100%; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+h1 { color: #333; margin-bottom: 20px; }
+.tab { overflow-x: auto; border: 1px solid #ccc; background: #f1f1f1; margin-bottom: 20px; white-space: nowrap; }
+.tab button { background: inherit; border: none; padding: 14px 16px; cursor: pointer; font-size: 13px; font-weight: 500; }
+.tab button:hover { background: #ddd; }
+.tab button.active { background: #4CAF50; color: white; }
+.tabcontent { display: none; }
+table { width: 100%; border-collapse: collapse; font-size: 11px; }
+th, td { border: 1px solid #ddd; padding: 4px; text-align: left; min-width: 80px; }
+th { color: white; position: sticky; top: 0; z-index: 10; }
+th .col-name { display: block; font-weight: bold; }
+th .help-icon { display: inline-block; width: 16px; height: 16px; background: rgba(255,255,255,0.3); color: white; border-radius: 50%; text-align: center; line-height: 16px; font-size: 11px; font-weight: bold; cursor: help; margin-top: 4px; }
+th .help-icon:hover { background: rgba(255,255,255,0.5); }
+/* Цвета разделов */
+.th-section-green { background: #C8E6C9 !important; color: #333 !important; }
+.th-section-brown { background: #D7CCC8 !important; color: #333 !important; }
+.th-section-orange { background: #FFE0B2 !important; color: #333 !important; }
+.th-section-blue { background: #B3E5FC !important; color: #333 !important; }
+.th-section-pink { background: #F8BBD0 !important; color: #333 !important; }
+.th-section-red { background: #FFCDD2 !important; color: #333 !important; }
+.th-yellow { background: #FFC107 !important; color: #333 !important; }
+.th-green { background: #4CAF50 !important; }
+.th-brown { background: #795548 !important; }
+.th-orange { background: #FF9800 !important; }
+.th-pink { background: #E91E63 !important; }
+.th-blue-1 { background: #2196F3 !important; }
+.th-blue-2 { background: #1976D2 !important; }
+.th-blue-3 { background: #0D47A1 !important; }
+.th-purple-1 { background: #9C27B0 !important; }
+.th-purple-2 { background: #7B1FA2 !important; }
+.th-teal-1 { background: #009688 !important; }
+.th-teal-2 { background: #00796B !important; }
+.th-red-1 { background: #F44336 !important; }
+.th-red-2 { background: #D32F2F !important; }
+.th-cyan { background: #00BCD4 !important; }
+.th-indigo { background: #3F51B5 !important; }
+tr:nth-child(even) { background: #f9f9f9; }
+tr:hover { background: #f1f1f1; }
+input, textarea, select { width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px; border: 1px solid #ccc; border-radius: 2px; }
+/* 🔥 РАСТЯГИВАНИЕ TEXTAREA ВНИЗ И ВБОК */
+textarea { 
+    resize: both; 
+    min-height: 25px; 
+    min-width: 150px;
+    overflow: auto;
+}
+.btn { padding: 6px 12px; border: none; border-radius: 3px; cursor: pointer; margin: 3px 0; font-size: 11px; }
+.btn-add { background: #2196F3; color: white; }
+.btn-save { background: #4CAF50; color: white; font-size: 13px; padding: 8px 16px; margin: 10px 0; }
+.btn-delete { background: #f44336; color: white; padding: 3px 6px; }
+.status { padding: 10px; margin: 10px 0; border-radius: 4px; display: none; }
+.status.success { background: #dff0d8; color: #3c763d; display: block; }
+.status.error { background: #f2dede; color: #a94442; display: block; }
+.scroll { overflow-x: auto; max-height: 600px; overflow-y: auto; }
+.info-box { background: #e7f3ff; padding: 10px; border-radius: 4px; margin-bottom: 15px; border-left: 4px solid #2196F3; }
+.debug { background: #fff3cd; padding: 10px; margin-top: 20px; border-radius: 4px; border-left: 4px solid #ffc107; font-size: 10px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
+.tooltip { position: fixed; z-index: 10000; background: #333; color: #fff; padding: 10px; border-radius: 4px; font-size: 12px; max-width: 500px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); pointer-events: none; display: none; line-height: 1.5; }
+.tooltip.show { display: block; }
+.tooltip code { background: #555; padding: 2px 4px; border-radius: 2px; font-family: monospace; }
+select { padding: 2px; font-size: 11px; }
+.hint { font-size: 10px; color: #666; margin-top: 2px; }
+.section-header { text-align: center; font-weight: bold; padding: 6px !important; }
+.color-link-cell { min-width: 120px; }
+.color-link-cell select, .color-link-cell input { width: 100%; padding: 2px; font-size: 11px; }
+.color-link-cell .link-input { display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🤖 Админ-панель Большого Бота</h1>
+<div class="info-box"><strong>ℹ️ Информация:</strong> Данные хранятся в Yandex Object Storage. Изменения сохраняются после нажатия "💾 Сохранить".</div>
+<div id="status" class="status"></div>
+<div class="tab">
+<button class="tablinks active" onclick="openTab(event,'Messages')">📨 Сообщения</button>
+<button class="tablinks" onclick="openTab(event,'Comments')">💬 Комментарии</button>
+<button class="tablinks" onclick="openTab(event,'Users')">👥 Пользователи</button>
+<button class="tablinks" onclick="openTab(event,'Variables')">⚙️ Переменные</button>
+<button class="tablinks" onclick="openTab(event,'Mailing')">📢 Рассылка</button>
+<button class="tablinks" onclick="openTab(event,'Delayed')">⏰ Отложенные</button>
+<button class="tablinks" onclick="openTab(event,'Settings')">🔧 Настройки</button>
+</div>
+<!-- MESSAGES COMMUNITY -->
+<div id="Messages" class="tabcontent" style="display:block;">
+<h3>MESSAGES COMMUNITY</h3>
+<button class="btn btn-add" onclick="addRow('Messages')">+ Добавить строку</button>
+<button class="btn btn-add" style="background:#FF9800;" onclick="addButtonColumns('Messages')">➕ Добавить кнопки</button>
+<button class="btn btn-add" style="background:#9C27B0;" onclick="addFallbackColumn('Messages')">📝 Добавить ЗО</button>
+<button class="btn btn-add" style="background:#00BCD4;" onclick="addFallbackButtonColumns('Messages')">🔘 Добавить кнопки ЗО</button>
+<div id="loading-Messages">Загрузка...</div>
+<div class="scroll"><table id="table-Messages"><tbody></tbody></table></div>
+<button class="btn btn-save" onclick="saveData('Messages')">💾 Сохранить</button>
+</div>
+<!-- COMMENTS -->
+<div id="Comments" class="tabcontent">
+<h3>COMMENTS</h3>
+<button class="btn btn-add" onclick="addRow('Comments')">+ Добавить строку</button>
+<div id="loading-Comments">Загрузка...</div>
+<div class="scroll"><table id="table-Comments"><tbody></table></div>
+<button class="btn btn-save" onclick="saveData('Comments')">💾 Сохранить</button>
+</div>
+<!-- USERS -->
+<div id="Users" class="tabcontent">
+<h3>USERS</h3>
+<div id="loading-Users">Загрузка...</div>
+<div class="scroll"><table id="table-Users"><tbody></table></div>
+<button class="btn btn-save" onclick="saveData('Users')">💾 Сохранить</button>
+</div>
+<!-- VARIABLES -->
+<div id="Variables" class="tabcontent">
+<h3>Переменные</h3>
+<button class="btn btn-add" onclick="addRow('Variables')">+ Добавить строку</button>
+<div id="loading-Variables">Загрузка...</div>
+<div class="scroll"><table id="table-Variables"><tbody></table></div>
+<button class="btn btn-save" onclick="saveData('Variables')">💾 Сохранить</button>
+</div>
+<!-- MAILING -->
+<div id="Mailing" class="tabcontent">
+<h3>Рассылка</h3>
+<button class="btn btn-add" onclick="addRow('Mailing')">+ Добавить строку</button>
+<div id="loading-Mailing">Загрузка...</div>
+<div class="scroll"><table id="table-Mailing"><tbody></table></div>
+<button class="btn btn-save" onclick="saveData('Mailing')">💾 Сохранить</button>
+</div>
+
+
+<!-- DELAYED -->
+
+
+<div id="Delayed" class="tabcontent">
+<h3>Отложенные</h3>
+<button class="btn btn-add" onclick="addRow('Delayed')">+ Добавить строку</button>
+<div id="loading-Delayed">Загрузка...</div>
+<div class="scroll"><table id="table-Delayed"><tbody></tbody></table></div>
+<button class="btn btn-save" onclick="saveData('Delayed')">💾 Сохранить</button>
+</div>
+
+<!-- SETTINGS -->
+<div id="Settings" class="tabcontent">
+<h3>🔧 Настройки бота</h3>
+<div class="info-box">
+<strong>ℹ️ Подтверждение вебхука ВКонтакте:</strong><br>
+VK присылает код подтверждения. Скопируйте его и вставьте ниже.
+</div>
+<div id="confirmation-status"></div>
+<label><strong>Код подтверждения от VK:</strong></label>
+<input type="text" id="confirmationCode" placeholder="Например: 4997d10b" style="margin: 10px 0; padding: 8px; font-size: 14px;">
+<button class="btn btn-save" onclick="saveConfirmationCode()">💾 Сохранить код</button>
+<hr style="margin: 20px 0;">
+<label><strong>Secret Key:</strong></label>
+<input type="text" id="secretKey" placeholder="Ваш секретный ключ" style="margin: 10px 0; padding: 8px; font-size: 14px;">
+<button class="btn btn-save" onclick="saveSecretKey()">💾 Сохранить Secret Key</button>
+<div class="debug" id="settings-debug">Загрузка настроек...</div>
+</div>
+
+
+<div class="debug" id="debugLog">🔌 Initializing...</div>
+</div>
+<div class="tooltip" id="tooltip"></div>
+<script>
+(function() {
+const debug = function(msg) {
+console.log('[Admin]', msg);
+const el = document.getElementById('debugLog');
+if (el) el.innerHTML += '\\n[' + new Date().toLocaleTimeString() + '] ' + msg;
+};
+let dataStore = {};
+const sheetMap = {
+'Messages': 'MESSAGES COMMUNITY',
+'Comments': 'COMMENTS',
+'Users': 'USERS',
+'Variables': 'Переменные',
+'Mailing': 'Рассылка',
+'Delayed': 'Отложенные'
+};
+const buttonColors = ['th-blue-1','th-blue-2','th-blue-3','th-purple-1','th-purple-2','th-teal-1','th-teal-2','th-red-1','th-red-2','th-cyan'];
+const fallbackButtonColors = ['th-indigo','th-purple-1','th-purple-2','th-teal-1','th-teal-2','th-red-1','th-red-2','th-cyan','th-blue-1','th-blue-2'];
+const messagesColumns = [
+{ name: '№', class: 'th-yellow', hint: 'Номер строки (авто)', section: 'ОСНОВНОЕ' },
+{ name: 'Триггер', class: 'th-green', hint: '<strong>Слово/фраза для реакции</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>привет</code> — одно слово<br>• <code>привет,здравствуй,добрый день</code> — несколько через запятую<br>• <code>помощь, поддержка, сервис</code> — синонимы', section: 'ОСНОВНОЕ' },
+{ name: 'Ответ', class: 'th-green', hint: '<strong>Текст ответа бота</strong><br><br>📖 <strong>Примеры с переменными:</strong><br>• <code>Привет, %vk_user%!</code> — имя пользователя<br>• <code>Ваш баланс: {$10$} руб.</code> — пользовательская переменная<br>• <code>Курс: [$100$] рублей</code> — глобальная переменная<br>• <code>Сегодня %vk_date%, время %vk_time%</code> — дата и время', section: 'ОСНОВНОЕ' },
+{ name: 'Бот', class: 'th-green', hint: '<strong>Имя бота для разделения</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>main</code> — основной бот<br>• <code>support</code> — техподдержка<br>• <code>sales</code> — отдел продаж', section: 'ОСНОВНОЕ' },
+{ name: 'Шаг', class: 'th-green', hint: '<strong>Шаг диалога</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>start</code> — начало диалога<br>• <code>step1</code> — первый шаг<br>• <code>menu</code> — меню<br>• <code>payment</code> — оплата', section: 'ОСНОВНОЕ' },
+{ name: 'Точно/Не точно', class: 'th-brown', type: 'select', options: ['ТОЧНО', 'НЕ ТОЧНО'], hint: '<strong>Тип совпадения</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>ТОЧНО</code> — "привет" = только "привет"<br>• <code>НЕ ТОЧНО</code> — "привет" = "привет друг", "скажи привет"', section: 'УСЛОВИЯ ПРОВЕРКИ' },
+{ name: 'Регистр', class: 'th-brown', type: 'select', options: ['важно', 'не важно'], hint: '<strong>Учитывать регистр</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>важно</code> — "Привет" ≠ "привет"<br>• <code>не важно</code> — "Привет" = "ПРИВЕТ" = "привет"', section: 'УСЛОВИЯ ПРОВЕРКИ' },
+{ name: 'Ответить если в Группе', class: 'th-brown', hint: '<strong>Группы пользователей</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>1,11,я</code> — группы 1, 11, я<br>• <code>vip,client</code> — vip и клиенты<br>• Пусто = отвечать всем', section: 'УСЛОВИЯ ПРОВЕРКИ' },
+{ name: 'Пользовательская Переменная ПП', class: 'th-brown', hint: '<strong>Условие по переменной пользователя</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>10</code> — проверить существование<br>• <code>11 = друг</code> — должна быть равна "друг"<br>• <code>12 != враг</code> — НЕ должна быть "враг"<br>• <code>13 > 5</code> — больше 5<br>• <code>10, 11 = друг</code> — несколько условий', section: 'УСЛОВИЯ ПРОВЕРКИ' },
+{ name: 'Глобальная Переменная ГП', class: 'th-brown', hint: '<strong>Условие по глобальной переменной</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>100</code> — проверить существование<br>• <code>101 = активен</code> — должна быть "активен"<br>• <code>102 != заблокирован</code> — НЕ "заблокирован"<br>• <code>103 > 1000</code> — больше 1000', section: 'УСЛОВИЯ ПРОВЕРКИ' },
+{ name: 'Задержка отправки на Шаг', class: 'th-brown', hint: '<strong>Задержка перед переходом</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>5</code> — 5 секунд<br>• <code>10мин</code> — 10 минут<br>• <code>1час</code> — 1 час<br>• <code>2минуты</code> — 2 минуты', section: 'УСЛОВИЯ ПРОВЕРКИ' },
+{ name: 'ДОБАВИТЬ ГРУППУ', class: 'th-orange', hint: '<strong>Добавить в группу после ответа</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>vip</code> — добавить в vip<br>• <code>client,new</code> — в client и new', section: 'ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ' },
+{ name: 'УДАЛИТЬ ГРУППУ', class: 'th-orange', hint: '<strong>Удалить из группы</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>new</code> — удалить из new<br>• <code>trial,test</code> — из trial и test', section: 'ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ' },
+{ name: 'Отправить на Шаг', class: 'th-orange', hint: '<strong>Перевести на шаг</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>step2</code> — перейти на step2<br>• <code>menu</code> — перейти в меню', section: 'ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ' },
+{ name: 'Действия с ПП/ГП/ПВК', class: 'th-orange', hint: '<strong>Операции с переменными</strong><br><br>📖 <strong>Присвоение:</strong><br>• <code>{$10$} = 5</code> — присвоить 5<br>• <code>{$11$} = текст</code> — присвоить текст<br>• <code>[$100$] = глобальное</code> — глобальной<br><br>📖 <strong>Математика:</strong><br>• <code>{$10$} = {$10$} + 1</code> — увеличить<br>• <code>{$11$} = {$11$} - 5</code> — уменьшить<br>• <code>{$12$} = {$12$} * 2</code> — умножить<br>• <code>{$13$} = {$13$} / 2</code> — разделить<br><br>📖 <strong>Копирование:</strong><br>• <code>{$10$} = [$100$]</code> — глобальную в пользовательскую<br>• <code>[$100$] = {$10$}</code> — наоборот<br><br>📖 <strong>Случайное:</strong><br>• <code>{$10$} = [$rnd$]</code> — случайное число<br>• <code>{$10$} = [$rnd:1-10$]</code> — от 1 до 10<br><br>📖 <strong>Несколько операций:</strong><br>• <code>{$10$} = 5; {$11$} = {$10$} + 1; [$100$] = готов</code><br>• <code>{$10$} = 5, {$11$} = 10</code> — через запятую', section: 'ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ' },
+{ name: 'Тип кнопок ответа', class: 'th-yellow', type: 'select', options: ['ДА', 'НЕТ'], hint: '<strong>Тип клавиатуры</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>ДА</code> — inline-кнопки в сообщении<br>• <code>НЕТ</code> — обычные кнопки под полем ввода<br><br>⚠️ Inline: цвета могут не отображаться во всех клиентах ВК', section: 'КНОПКИ В ОТВЕТЕ' }
+];
+function generateAnswerButtonColumns(startIdx, endIdx) {
+const cols = [];
+for (let i = startIdx; i <= endIdx; i++) {
+const colorIdx = (i - 1) % buttonColors.length;
+cols.push({ name: 'Кнопка Ответа-' + i, class: buttonColors[colorIdx], hint: '<strong>Текст кнопки ' + i + '</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>Услуги</code><br>• <code>Цены</code><br>• <code>Контакты</code><br>• <code>Помощь</code>', section: 'КНОПКИ В ОТВЕТЕ' });
+cols.push({ name: 'Цвет/Ссылка Ответа-' + i, class: buttonColors[colorIdx], type: 'select', options: ['красный','зелёный','синий','белый','ССЫЛКА...'], hint: '<strong>Цвет или ссылка</strong><br><br>📖 <strong>Примеры цветов:</strong><br>• <code>красный</code> — negative<br>• <code>зелёный</code> — positive<br>• <code>синий</code> — primary<br>• <code>белый</code> — secondary<br><br>📖 <strong>Пример ссылки:</strong><br>• Выберите <code>ССЫЛКА...</code><br>• Введите: <code>https://site.ru</code>', section: 'КНОПКИ В ОТВЕТЕ' });
+}
+return cols;
+}
+function generateFallbackButtonColumns(startIdx, endIdx) {
+const cols = [];
+for (let i = startIdx; i <= endIdx; i++) {
+const colorIdx = (i - 1) % fallbackButtonColors.length;
+cols.push({ name: 'Кнопка ЗО-' + i, class: fallbackButtonColors[colorIdx], hint: '<strong>Текст кнопки ЗО ' + i + '</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>Помощь</code><br>• <code>Админ</code><br>• <code>Назад</code>', section: 'КНОПКИ В ЗАГОТОВЛЕННОМ ОТВЕТЕ' });
+cols.push({ name: 'Цвет/Ссылка ЗО-' + i, class: fallbackButtonColors[colorIdx], type: 'select', options: ['красный','зелёный','синий','белый','ССЫЛКА...'], hint: '<strong>Цвет или ссылка для ЗО</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>красный</code>, <code>синий</code><br>• <code>ССЫЛКА...</code> + URL', section: 'КНОПКИ В ЗАГОТОВЛЕННОМ ОТВЕТЕ' });
+}
+return cols;
+}
+const columns = {
+'Messages': [
+...messagesColumns,
+...generateAnswerButtonColumns(1, 10)
+],
+'Comments': [
+{ name: '№', class: 'th-yellow', hint: 'Номер строки' },
+{ name: 'Триггер', class: 'th-green', hint: '<strong>Слово для реакции</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>спасибо</code><br>• <code>помогите, помощь</code>' },
+{ name: 'Ответ', class: 'th-green', hint: '<strong>Текст ответа</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>Пожалуйста!</code><br>• <code>%vk_user%, рад помочь!</code>' },
+{ name: 'Бот', class: 'th-green', hint: 'Имя бота' },
+{ name: 'Шаг', class: 'th-green', hint: 'Шаг диалога' },
+{ name: 'Пост', class: 'th-brown', hint: '<strong>ID поста</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>-229445618_123</code> — конкретный<br>• <code>ВСЕ</code> — все посты' },
+{ name: 'Отметили', class: 'th-brown', type: 'select', options: ['', 'ДА', 'НЕТ'], hint: '<strong>Упоминание сообщества</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>ДА</code> — только если упомянули<br>• <code>НЕТ</code> — только если НЕ упомянули' },
+{ name: 'Точно/Не точно', class: 'th-brown', type: 'select', options: ['ТОЧНО', 'НЕ ТОЧНО'] },
+{ name: 'Регистр', class: 'th-brown', type: 'select', options: ['важно', 'не важно'] },
+{ name: 'Ответить если в Группе', class: 'th-brown', hint: 'Группы пользователей' },
+{ name: 'ГРУППА', class: 'th-orange', hint: 'Добавить в группу' },
+{ name: 'УДАЛИТЬ ГРУППУ', class: 'th-orange', hint: 'Удалить из группы' },
+{ name: 'Отправить на Шаг', class: 'th-orange', hint: 'Перевод на шаг' },
+{ name: 'Задержка отправки на Шаг', class: 'th-brown', hint: 'Задержка: 5, 10мин, 1час' },
+{ name: 'Действия с ПП/ГП/ПВК', class: 'th-orange', hint: 'Операции с переменными' },
+{ name: 'Заготовленный ответ', class: 'th-pink', hint: 'Fallback ответ' },
+{ name: 'Заг.Ответ для', class: 'th-pink', hint: '<strong>Для каких постов</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>ВСЕ</code><br>• <code>-229445618_123,-229445618_124</code>' },
+{ name: 'ЗО-Отметили', class: 'th-pink', type: 'select', options: ['', 'ДА', 'НЕТ'] }
+],
+'Users': [
+{ name: 'ID', class: 'th-yellow', hint: 'ID пользователя ВК (не редактировать)' },
+{ name: 'ИМЯ', class: 'th-green', hint: 'Имя пользователя (авто)' },
+{ name: 'ГРУППА', class: 'th-orange', hint: '<strong>Группы пользователя</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>1,11,я</code><br>• <code>vip,client</code>' },
+{ name: 'Пользовательская', class: 'th-orange', hint: '<strong>Переменные пользователя</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>10,11,12</code>' },
+{ name: 'Значения ПП', class: 'th-orange', hint: '<strong>Значения переменных</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>5,100,abc</code>' },
+{ name: 'Текущий Бот', class: 'th-green', hint: 'Активный бот' },
+{ name: 'Текущий Шаг', class: 'th-green', hint: 'Текущий шаг' }
+],
+'Variables': [
+{ name: 'Пользовательская', class: 'th-orange', hint: '<strong>Имя переменной</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>10</code> — соответствует {$10$}<br>• <code>balance</code> — баланс' },
+{ name: 'Значение ПП', class: 'th-orange', hint: 'Значение по умолчанию' },
+{ name: 'Глобальная', class: 'th-orange', hint: '<strong>Имя глобальной</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>100</code> — соответствует [$100$]<br>• <code>rate</code> — курс' },
+{ name: 'Значение ГП', class: 'th-orange', hint: 'Значение глобальной' },
+{ name: 'Переменные ВК', class: 'th-green', hint: '<strong>Системные переменные</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>%vk_user%</code> — имя<br>• <code>%vk_user_id%</code> — ID<br>• <code>%vk_date%</code> — дата<br>• <code>%vk_time%</code> — время' },
+{ name: 'Значение/Описание ПВК', class: 'th-green', hint: 'Описание' }
+],
+'Mailing': [
+{ name: '№', class: 'th-yellow', hint: 'Номер рассылки' },
+{ name: 'Сообщение Рассылки', class: 'th-green', hint: '<strong>Текст рассылки</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>Акция до конца недели!</code><br>• <code>%vk_user%, специальное предложение!</code>' },
+{ name: 'ID Получателей', class: 'th-orange', hint: '<strong>ID пользователей</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>27894453,123456</code><br>• Через запятую' },
+{ name: 'ГРУППА Получателей', class: 'th-orange', hint: '<strong>Группы для рассылки</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>vip,client</code>' },
+{ name: 'Дата и время отправки', class: 'th-brown', hint: '<strong>Планирование</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>2025-08-09 20:46:00</code>' },
+{ name: 'Статус', class: 'th-brown', type: 'select', options: ['Ожидает', 'Отправлено', 'Ошибка'] },
+{ name: 'Фактическое время отправки', class: 'th-brown', hint: 'Когда отправлено' }
+],
+'Delayed': [
+{ name: '№', class: 'th-yellow', hint: 'Номер строки' },
+{ name: 'Шаг', class: 'th-green', hint: '<strong>Имя шага</strong><br><br>📖 <strong>Примеры:</strong><br>• <code>step2</code><br>• <code>followup</code>' },
+{ name: 'ID Пользователя', class: 'th-orange', hint: 'ID получателя' },
+{ name: 'Группа', class: 'th-orange', hint: 'ID группы' },
+{ name: 'Тип', class: 'th-brown', type: 'select', options: ['message', 'comment'] },
+{ name: 'Дата и время отправки', class: 'th-brown', hint: 'Когда запланировано' },
+{ name: 'Статус', class: 'th-brown', type: 'select', options: ['Ожидает', 'Отправлено', 'Ошибка'] },
+{ name: 'Фактическое время отправки', class: 'th-brown', hint: 'Когда отправлено' },
+{ name: 'Ошибка', class: 'th-red-1', hint: 'Текст ошибки' }
+]
+};
+const tooltip = document.getElementById('tooltip');
+document.addEventListener('mouseover', function(e) {
+if (e.target.classList.contains('help-icon')) {
+const text = e.target.getAttribute('data-hint');
+if (text) {
+tooltip.innerHTML = text.replace(/\\n/g, '<br>').replace(/<code>/g, '<code style="background:#555;padding:2px 4px;border-radius:2px;">').replace(/<\\/code>/g, '</code>');
+tooltip.classList.add('show');
+}
+}
+});
+document.addEventListener('mouseout', function(e) {
+if (e.target.classList.contains('help-icon')) {
+tooltip.classList.remove('show');
+}
+});
+document.addEventListener('mousemove', function(e) {
+if (tooltip.classList.contains('show')) {
+tooltip.style.left = (e.clientX + 10) + 'px';
+tooltip.style.top = (e.clientY + 10) + 'px';
+}
+});
+async function loadData(tab) {
+const sheet = sheetMap[tab];
+document.getElementById('loading-'+tab).style.display = 'block';
+debug('Loading ' + sheet);
+try {
+// 🔥 ИСПРАВЛЕНИЕ: Корректное формирование URL для Яндекс Функций
+const baseUrl = window.location.origin + window.location.pathname;
+const url = baseUrl + '?sheet=' + encodeURIComponent(sheet);
+//log('debug', '🔗 Fetching data from:' ${url});
+const res = await fetch(url);
+if (!res.ok) throw new Error('HTTP ' + res.status);
+const data = await res.json();
+dataStore[tab] = data || [];
+renderTable(tab, data);
+debug('Loaded ' + (data?.length || 0) + ' rows');
+} catch (e) {
+debug('Error: ' + e.message);
+showStatus('Ошибка загрузки: ' + e.message, 'error');
+}
+document.getElementById('loading-'+tab).style.display = 'none';
+}
+function renderTable(tab, data) {
+const table = document.getElementById('table-'+tab);
+const cols = columns[tab] || [];
+if (!data || !data.length) {
+table.innerHTML = '<tr><td colspan="'+(cols.length+1)+'">Нет данных. Нажмите "+ Добавить строку"</td></tr>';
+return;
+}
+const sections = {};
+cols.forEach((col, idx) => {
+const section = (typeof col === 'object' && col.section) ? col.section : 'ОСНОВНОЕ';
+if (!sections[section]) sections[section] = [];
+sections[section].push({ col, idx });
+});
+const sectionColors = {
+'ОСНОВНОЕ': '#C8E6C9',
+'УСЛОВИЯ ПРОВЕРКИ': '#D7CCC8',
+'ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ': '#FFE0B2',
+'КНОПКИ В ОТВЕТЕ': '#B3E5FC',
+'КНОПКИ В ЗАГОТОВЛЕННОМ ОТВЕТЕ': '#F8BBD0',
+'УДАЛЕНИЕ': '#FFCDD2'
+};
+let html = '<thead>';
+html += '<tr>';
+for (const [sectionName, sectionCols] of Object.entries(sections)) {
+const bgColor = sectionColors[sectionName] || '#E0E0E0';
+html += '<th colspan="'+sectionCols.length+'" class="section-header" style="background:'+bgColor+'">'+sectionName+'</th>';
+}
+html += '<th class="section-header" style="background:#FFCDD2">🗑️</th></tr>';
+html += '<tr>';
+cols.forEach(col => {
+const name = typeof col === 'string' ? col : col.name;
+const colClass = typeof col === 'object' && col.class ? col.class : 'th-green';
+const hint = typeof col === 'object' && col.hint ? col.hint : '';
+html += '<th class="'+colClass+'">';
+html += '<span class="col-name">'+name+'</span>';
+if (hint) {
+html += '<span class="help-icon" data-hint="'+hint.replace(/"/g,'&quot;')+'">?</span>';
+}
+html += '</th>';
+});
+html += '<th style="background:#FFCDD2">❌</th></tr></thead><tbody>';
+data.forEach((row, idx) => {
+html += '<tr>';
+cols.forEach(col => {
+const name = typeof col === 'string' ? col : col.name;
+const colType = typeof col === 'object' && col.type ? col.type : 'text';
+const options = typeof col === 'object' && col.options ? col.options : null;
+const val = row[name] || '';
+if (colType === 'select' && options) {
+const isLinkField = name.includes('Цвет/Ссылка');
+const [currentColor, currentLink] = (val || '').split('||');
+html += '<td class="color-link-cell">';
+html += '<select class="color-select" data-idx="'+idx+'" data-name="'+name.replace(/'/g,"\\'")+'" data-tab="'+tab+'" onchange="updateColorLink(\\''+tab+'\\','+idx+',\\''+name.replace(/'/g,"\\'")+'\\',this.value)">';
+options.forEach(opt => {
+const selected = currentColor === opt ? 'selected' : '';
+html += '<option value="'+opt+'" '+selected+'>'+opt+'</option>';
+});
+html += '</select>';
+if (isLinkField) {
+const linkStyle = currentColor === 'ССЫЛКА...' ? 'display:block;' : 'display:none;';
+html += '<input type="url" class="link-input" placeholder="https://..." value="'+(currentLink||'').replace(/"/g,'&quot;')+'" style="'+linkStyle+'margin-top:3px;" onchange="updateColorLink(\\''+tab+'\\','+idx+',\\''+name.replace(/'/g,"\\'")+'\\',\\'ССЫЛКА...\\',this.value)">';
+}
+html += '</td>';
+} else {
+// 🔥 Поля с множественными значениями (каждое с новой строки)
+// 🔥 Поля с множественными значениями (каждое с новой строки)
+const isMultiline = ['Пользовательская', 'Значения ПП', 'ГРУППА', 'Текущий Бот', 'Текущий Шаг'].includes(name);
+const isLong = val.length > 25 || name === 'Ответ' || name === 'Заготовленный ответ' || isMultiline;
+
+if (isLong) {
+    // 🔥 Подсчитываем количество строк для textarea
+    const lineCount = val.split('\n').length || 2;
+    html += '<td><textarea onchange="updateCell(\\''+tab+'\\','+idx+',\\''+name+'\\',this.value)" rows="'+Math.max(lineCount, 2)+'">'+val.replace(/"/g,'&quot;')+'</textarea></td>';
+} else {
+    html += '<td><input value="'+val.replace(/"/g,'&quot;')+'" onchange="updateCell(\\''+tab+'\\','+idx+',\\''+name+'\\',this.value)"></td>';
+}
+});
+html += '<td style="background:#FFCDD2"><button class="btn btn-delete" onclick="deleteRow(\\''+tab+'\\','+idx+')">✕</button></td></tr>';
+});
+table.innerHTML = html + '</tbody>';
+}
+window.updateCell = function(tab, idx, key, val) {
+if (!dataStore[tab][idx]) dataStore[tab][idx] = {};
+dataStore[tab][idx][key] = val;
+};
+window.updateColorLink = function(tab, idx, key, color, linkValue) {
+if (!dataStore[tab][idx]) dataStore[tab][idx] = {};
+if (linkValue !== undefined && linkValue !== null) {
+dataStore[tab][idx][key] = color + '||' + (linkValue || '');
+} else {
+dataStore[tab][idx][key] = color;
+}
+};
+document.addEventListener('change', function(e) {
+if (e.target.classList.contains('color-select')) {
+const cell = e.target.closest('td');
+const linkInput = cell?.querySelector('.link-input');
+if (linkInput) {
+linkInput.style.display = e.target.value === 'ССЫЛКА...' ? 'block' : 'none';
+if (e.target.value !== 'ССЫЛКА...') {
+linkInput.value = '';
+}
+}
+}
+});
+window.deleteRow = function(tab, idx) {
+if (confirm('Удалить строку?')) {
+dataStore[tab].splice(idx, 1);
+renderTable(tab, dataStore[tab]);
+debug('Deleted row '+idx+' from '+tab);
+}
+};
+window.addRow = function(tab) {
+if (!dataStore[tab]) dataStore[tab] = [];
+const cols = columns[tab] || [];
+const template = {};
+cols.forEach(col => {
+const name = typeof col === 'string' ? col : col.name;
+if (name === 'Тип кнопок ответа' || name === 'Тип кнопок ЗО') {
+template[name] = 'ДА';
+} else {
+template[name] = '';
+}
+});
+if (template['№']) template['№'] = (dataStore[tab].length + 1).toString();
+dataStore[tab].push(template);
+renderTable(tab, dataStore[tab]);
+debug('Added row to '+tab);
+};
+window.addButtonColumns = function(tab) {
+if (tab !== 'Messages') { alert('Доступно только для Сообщений'); return; }
+const cols = columns[tab] || [];
+const existingButtons = cols.filter(c => typeof c === 'object' && c.name?.startsWith('Кнопка Ответа-')).length;
+if (existingButtons >= 10) { alert('Максимум 10 кнопок ответа уже добавлено!'); return; }
+const newBtnNum = existingButtons + 1;
+const colorIdx = (newBtnNum - 1) % buttonColors.length;
+cols.push({ name: 'Кнопка Ответа-' + newBtnNum, class: buttonColors[colorIdx], hint: 'Текст кнопки ' + newBtnNum, section: 'КНОПКИ В ОТВЕТЕ' });
+cols.push({ name: 'Цвет/Ссылка Ответа-' + newBtnNum, class: buttonColors[colorIdx], type: 'select', options: ['красный','зелёный','синий','белый','ССЫЛКА...'], hint: 'Цвет или ссылка', section: 'КНОПКИ В ОТВЕТЕ' });
+renderTable(tab, dataStore[tab]);
+debug('Added button column '+newBtnNum);
+};
+window.addFallbackColumn = function(tab) {
+if (tab !== 'Messages') { alert('Доступно только для Сообщений'); return; }
+const cols = columns[tab] || [];
+const hasFallback = cols.some(c => typeof c === 'object' && c.name === 'Заготовленный ответ');
+if (hasFallback) { alert('Заготовленный ответ уже добавлен!'); return; }
+const fallbackSectionIdx = cols.findIndex(c => (typeof c === 'object' && c.section === 'КНОПКИ В ОТВЕТЕ'));
+cols.splice(fallbackSectionIdx + 1, 0, { name: 'Тип кнопок ЗО', class: 'th-yellow', type: 'select', options: ['ДА', 'НЕТ'], hint: 'ДА = inline, НЕТ = обычные', section: 'КНОПКИ В ЗАГОТОВЛЕННОМ ОТВЕТЕ' });
+cols.push({ name: 'Заготовленный ответ', class: 'th-pink', hint: 'Fallback ответ', section: 'КНОПКИ В ЗАГОТОВЛЕННОМ ОТВЕТЕ' });
+renderTable(tab, dataStore[tab]);
+debug('Added fallback column');
+};
+window.addFallbackButtonColumns = function(tab) {
+if (tab !== 'Messages') { alert('Доступно только для Сообщений'); return; }
+const cols = columns[tab] || [];
+const existingFallbackButtons = cols.filter(c => typeof c === 'object' && c.name?.startsWith('Кнопка ЗО-')).length;
+if (existingFallbackButtons >= 10) { alert('Максимум 10 кнопок ЗО уже добавлено!'); return; }
+const hasFallback = cols.some(c => typeof c === 'object' && c.name === 'Заготовленный ответ');
+if (!hasFallback) { alert('Сначала добавьте заготовленный ответ!'); return; }
+const newBtnNum = existingFallbackButtons + 1;
+const colorIdx = (newBtnNum - 1) % fallbackButtonColors.length;
+cols.push({ name: 'Кнопка ЗО-' + newBtnNum, class: fallbackButtonColors[colorIdx], hint: 'Текст кнопки ЗО ' + newBtnNum, section: 'КНОПКИ В ЗАГОТОВЛЕННОМ ОТВЕТЕ' });
+cols.push({ name: 'Цвет/Ссылка ЗО-' + newBtnNum, class: fallbackButtonColors[colorIdx], type: 'select', options: ['красный','зелёный','синий','белый','ССЫЛКА...'], hint: 'Цвет или ссылка', section: 'КНОПКИ В ЗАГОТОВЛЕННОМ ОТВЕТЕ' });
+renderTable(tab, dataStore[tab]);
+debug('Added fallback button column '+newBtnNum);
+};
+window.saveData = async function(tab) {
+const btn = event.target;
+const orig = btn.innerText;
+btn.innerText = '⏳ Сохранение...';
+btn.disabled = true;
+try {
+const sheet = sheetMap[tab];
+const url = window.location.href.split('?')[0] + '?save=' + encodeURIComponent(sheet);
+const res = await fetch(url, {
+method: 'POST',
+headers: {'Content-Type':'application/json'},
+body: JSON.stringify(dataStore[tab])
+});
+const result = await res.json();
+if (result.success) {
+showStatus('✅ Сохранено!', 'success');
+} else {
+throw new Error(result.error || 'Ошибка сохранения');
+}
+} catch (e) {
+showStatus('❌ Ошибка: ' + e.message, 'error');
+}
+btn.innerText = orig;
+btn.disabled = false;
+};
+function showStatus(msg, type) {
+const el = document.getElementById('status');
+el.innerText = msg;
+el.className = 'status ' + type;
+setTimeout(() => el.style.display = 'none', 5000);
+}
+window.openTab = function(evt, name) {
+document.querySelectorAll('.tabcontent').forEach(el => el.style.display = 'none');
+document.querySelectorAll('.tablinks').forEach(el => el.classList.remove('active'));
+document.getElementById(name).style.display = 'block';
+evt.currentTarget.classList.add('active');
+if (!dataStore[name]) loadData(name);
+};
+window.onload = async function() {
+debug('Page loaded');
+await loadData('Messages');
+};
+
+// 🔥 Функции для вкладки Настройки
+window.saveConfirmationCode = async function() {
+    const code = document.getElementById('confirmationCode').value.trim();
+    const status = document.getElementById('confirmation-status');
+    
+    if (!code) {
+        status.innerHTML = '<div class="status error">❌ Введите код подтверждения!</div>';
+        return;
+    }
+    
+    try {
+        const url = window.location.href.split('?')[0] + '?saveConfirmation=' + encodeURIComponent(code);
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirmation_code: code })
+        });
+        
+        const result = await res.json();
+        
+        if (result.success) {
+            status.innerHTML = '<div class="status success">✅ Код подтверждения сохранён! Теперь нажмите "Подтвердить" в настройках ВК.</div>';
+            debug('Confirmation code saved: ' + code);
+        } else {
+            status.innerHTML = '<div class="status error">❌ Ошибка: ' + result.error + '</div>';
+        }
+    } catch (e) {
+        status.innerHTML = '<div class="status error">❌ Ошибка: ' + e.message + '</div>';
+    }
+};
+
+window.saveSecretKey = async function() {
+    const key = document.getElementById('secretKey').value.trim();
+    const status = document.getElementById('confirmation-status');
+    
+    if (!key) {
+        status.innerHTML = '<div class="status error">❌ Введите Secret Key!</div>';
+        return;
+    }
+    
+    try {
+        const url = window.location.href.split('?')[0] + '?saveSecretKey=' + encodeURIComponent(key);
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ secret_key: key })
+        });
+        
+        const result = await res.json();
+        
+        if (result.success) {
+            status.innerHTML = '<div class="status success">✅ Secret Key сохранён!</div>';
+            debug('Secret Key saved');
+        } else {
+            status.innerHTML = '<div class="status error">❌ Ошибка: ' + result.error + '</div>';
+        }
+    } catch (e) {
+        status.innerHTML = '<div class="status error">❌ Ошибка: ' + e.message + '</div>';
+    }
+};
+
+// Загрузка настроек при открытии вкладки
+window.loadSettings = async function() {
+    const settingsDebug = document.getElementById('settings-debug');  // ✅ Другое имя переменной
+    try {
+        const url = window.location.href.split('?')[0] + '?getSettings';
+        const res = await fetch(url);
+        const data = await res.json();
+        
+        settingsDebug.innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';  // ✅ Работает с элементом
+        
+        if (data.confirmation_code) {
+            document.getElementById('confirmationCode').value = data.confirmation_code;
+        }
+        if (data.secret_key) {
+            document.getElementById('secretKey').value = data.secret_key;
+        }
+    } catch (e) {
+        settingsDebug.innerHTML = '❌ Ошибка загрузки: ' + e.message;  // ✅ Работает с элементом
+    }
+};
+
+// Обновлённая openTab для загрузки настроек
+window.openTab = function(evt, name) {
+    document.querySelectorAll('.tabcontent').forEach(el => el.style.display = 'none');
+    document.querySelectorAll('.tablinks').forEach(el => el.classList.remove('active'));
+    document.getElementById(name).style.display = 'block';
+    evt.currentTarget.classList.add('active');
+    
+    if (name === 'Settings') {
+        loadSettings();
+    } else if (!dataStore[name]) {
+        loadData(name);
+    }
+};
+
+})();
+</script>
+</body>
+</html>`;
+
+
+// ====================== ОСНОВНОЙ ОБРАБОТЧИК ======================
+// ====================== ОСНОВНОЙ ОБРАБОТЧИК ======================
+module.exports.handler = async function(event) {
+    // 🔥 ОТЛАДКА: Логируем ВСЕ входящие запросы
+    log('info', '🔔 RAW REQUEST:', {
+        method: event.httpMethod,
+        path: event.path,
+        query: event.queryStringParameters,
+        bodyPreview: event.body?.substring(0, 200)
+    });
+    
+    log('info', '===== REQUEST =====', event.httpMethod, event.path);
+    await initializeStorage();
+    
+    // CORS
+    if (event.httpMethod === 'OPTIONS') {
+        return {
+            statusCode: 200,
+            headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type'
+            },
+            body: ''
+        };
+    }
+    
+    // GET: админка или данные
+if (event.httpMethod === 'GET') {
+const q = event.queryStringParameters || {};
+// 🔥 ОТЛАДКА: Логируем все параметры GET-запроса
+log('debug', `🔍 GET query params:`, JSON.stringify(q));
+log('debug', `🔍 Full event for GET:`, {
+path: event.path,
+queryStringParameters: event.queryStringParameters,
+rawUrl: event.rawUrl || event.url
+});
+
+// 🔥 НОВОЕ: Загрузка настроек для админ-панели
+if (q.getSettings) {
+        return {
+            statusCode: 200,
+            headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            body: JSON.stringify({
+                confirmation_code: process.env.CONFIRMATION_TOKEN || '',
+                secret_key: process.env.SECRET_KEY || ''
+            })
+        };
+    }
+  
+        if (q.sheet) {
+            try {
+                const data = await getSheetData(q.sheet);
+                return {
+                    statusCode: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    body: JSON.stringify(data)
+                };
+            } catch (e) {
+                log('error', 'Error getting sheet:', e);
+                return {
+                    statusCode: 500,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    body: JSON.stringify({ error: e.message })
+                };
+            }
+        }
+        // Возвращаем админ-панель
+        return {
+            statusCode: 200,
+            headers: {
+                'Content-Type': 'text/html; charset=utf-8',
+                'Access-Control-Allow-Origin': '*'
+            },
+            body: adminPanelHTML
+        };
+    }
+    
+    // POST: сохранение или вебхук ВК
+    if (event.httpMethod === 'POST') {
+        const q = event.queryStringParameters || {};
+        
+        // Сохранение из админки
+        if (q.save) {
+            try {
+                const body = JSON.parse(event.body || '{}');
+                await saveSheetData(q.save, body);
+                return {
+                    statusCode: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    body: JSON.stringify({ success: true })
+                };
+            } catch (e) {
+                log('error', 'Save error:', e);
+                return {
+                    statusCode: 500,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    body: JSON.stringify({ success: false, error: e.message })
+                };
+            }
+        }
+
+// 🔥 НОВОЕ: Сохранение confirmation code
+if (q.saveConfirmation) {
+    try {
+        const body = JSON.parse(event.body || '{}');
+        const code = q.saveConfirmation;
+        
+        await s3Client.send(new PutObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: 'confirmation_code.json',
+            Body: JSON.stringify({ code: code, updated_at: new Date().toISOString() }),
+            ContentType: 'application/json'
+        }));
+        
+        return {
+            statusCode: 200,
+            headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            body: JSON.stringify({ success: true })
+        };
+    } catch (e) {
+        return {
+            statusCode: 500,
+            headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            body: JSON.stringify({ success: false, error: e.message })
+        };
+    }
+}
+
+// 🔥 НОВОЕ: Сохранение Secret Key
+if (q.saveSecretKey) {
+    try {
+        const body = JSON.parse(event.body || '{}');
+        const key = q.saveSecretKey;
+        
+        await s3Client.send(new PutObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: 'secret_key.json',
+            Body: JSON.stringify({ key: key, updated_at: new Date().toISOString() }),
+            ContentType: 'application/json'
+        }));
+        
+        return {
+            statusCode: 200,
+            headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            body: JSON.stringify({ success: true })
+        };
+    } catch (e) {
+        return {
+            statusCode: 500,
+            headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            body: JSON.stringify({ success: false, error: e.message })
+        };
+    }
+}
+        
+        // Вебхук от ВК
+        try {
+            const data = JSON.parse(event.body);
+            
+            // 🔥 ПОДТВЕРЖДЕНИЕ ВЕБХУКА
+// Подтверждение вебхука
+if (data.type === 'confirmation') {
+    log('info', 'Confirmation request');
+    log('debug', 'Confirmation data:', JSON.stringify(data));
+    
+    // 🔥 Возвращаем токен из переменных окружения
+    // Этот токен должен совпадать с тем, что показан в настройках ВК
+    const confirmationToken = process.env.CONFIRMATION_TOKEN || 'ok';
+    
+    log('info', `🔑 Returning confirmation token: ${confirmationToken}`);
+    
+    return {
+        statusCode: 200,
+        headers: { 'Content-Type': 'text/plain' },
+        body: confirmationToken
+    };
+}
+                      
+            // Проверка секретного ключа
+            
+            // Обработка событий
+            if (data.type === 'message_new') {
+                log('info', 'New message from VK');
+                handleMessage(data).catch(e => log('error', 'handleMessage:', e));
+            } else if (data.type === 'wall_reply_new') {
+                log('info', 'New comment from VK');
+                handleComment(data).catch(e => log('error', 'handleComment:', e));
+            }
+            
+            // Проверка отложенных
+            processDelayed().catch(e => log('error', 'processDelayed:', e));
+            
+            // Сразу отвечаем ВК
+            return {
+                statusCode: 200,
+                headers: {
+                    'Content-Type': 'text/plain',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                body: 'ok'
+            };
+            
+        } catch (e) {
+            log('error', 'Handler error:', e.message);
+            return {
+                statusCode: 500,
+                headers: { 'Access-Control-Allow-Origin': '*' },
+                body: 'Internal error'
+            };
+        }
+    }
+    
+    return { statusCode: 404, body: 'Not Found' };
+};
+
+
+Не запускается яндекс функция. Где ошибка?
